@@ -1,0 +1,30 @@
+# Python bytecode and build outputs
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Local virtual environments and test/lint caches
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime SQLite data, journal files, and generated backups
+data/*.sqlite3
+data/*.sqlite3-*
+data/*.restore.tmp
+data/*.manifest.json
+*.sqlite3.tmp
+*.restore.tmp
+logic_qa_backup_*.sqlite3
+logic_qa_backup_*.sqlite3.manifest.json
+
+# Local secrets and editor settings
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
