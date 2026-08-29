@@ -590,6 +590,17 @@ class AdminPracticeCorrectionAuditResponse(BaseModel):
     events: list[AdminPracticeCorrectionEventResponse]
 
 
+class AdminPracticeCorrectionReconciliationResponse(BaseModel):
+    """一页跨库重发布关联巡检结果，只报告当前未精确活动核验的关联。"""
+
+    total_linked_audits: int
+    offset: int
+    scanned_linked_audits: int
+    active_verified_audits: int
+    next_offset: int | None
+    non_verified_audits: list[AdminPracticeCorrectionAuditResponse]
+
+
 class PracticeCorrectionOutcomeResponse(BaseModel):
     """学习者可见的派生复核结果，不包含管理员与题库内部信息。"""
 
@@ -1136,6 +1147,50 @@ def list_admin_practice_correction_audits(
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     return [_practice_correction_audit_to_response(item) for item in audits]
+
+
+@app.get(
+    "/v1/admin/practice-correction-reconciliations",
+    response_model=AdminPracticeCorrectionReconciliationResponse,
+)
+def reconcile_admin_practice_correction_republications(
+    _: AdminIdentity,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10_000),
+) -> AdminPracticeCorrectionReconciliationResponse:
+    """分页巡检所有不可变关联，只读报告跨库当前核验异常。"""
+    try:
+        total_linked_audits = learning_store.count_linked_practice_correction_audits()
+        audits = learning_store.list_practice_correction_audits(
+            linked=True,
+            limit=limit,
+            offset=offset,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    audit_responses = [_practice_correction_audit_to_response(item) for item in audits]
+    active_verified_audits = sum(
+        response.republication_verification is not None
+        and response.republication_verification.status
+        is RepublicationVerificationStatus.ACTIVE_VERIFIED
+        for response in audit_responses
+    )
+    scanned_linked_audits = len(audit_responses)
+    next_offset = offset + scanned_linked_audits
+    return AdminPracticeCorrectionReconciliationResponse(
+        total_linked_audits=total_linked_audits,
+        offset=offset,
+        scanned_linked_audits=scanned_linked_audits,
+        active_verified_audits=active_verified_audits,
+        next_offset=next_offset if next_offset < total_linked_audits else None,
+        non_verified_audits=[
+            response
+            for response in audit_responses
+            if response.republication_verification is None
+            or response.republication_verification.status
+            is not RepublicationVerificationStatus.ACTIVE_VERIFIED
+        ],
+    )
 
 
 @app.get(

@@ -979,6 +979,123 @@ def test_admin_correction_audit_reports_missing_republication_version(
         "status": "missing",
         "observed_content_hash": None,
     }
+    reconciliation = client.get(
+        "/v1/admin/practice-correction-reconciliations",
+        headers=_ADMIN_HEADERS,
+    )
+
+    assert reconciliation.status_code == 200
+    reconciliation_payload = reconciliation.json()
+    assert reconciliation_payload["total_linked_audits"] == 1
+    assert reconciliation_payload["offset"] == 0
+    assert reconciliation_payload["scanned_linked_audits"] == 1
+    assert reconciliation_payload["active_verified_audits"] == 0
+    assert reconciliation_payload["next_offset"] is None
+    assert reconciliation_payload["non_verified_audits"] == [audit.json()]
+
+
+def test_admin_republication_reconciliation_paginates_linked_audits(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """巡检按稳定偏移量扫描关联，并只在异常页返回完整审计视图。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    for question_id in ("q-1", "q-2"):
+        first_payload = _publish_payload(question_id, "content-v1")
+        _prepare_and_approve(client, first_payload)
+        assert client.post(
+            "/v1/admin/questions",
+            headers=_ADMIN_HEADERS,
+            json=first_payload,
+        ).status_code == 200
+        attempt = client.post(
+            f"/v1/learning/questions/{question_id}/content-v1/attempts",
+            headers=_LEARNER_HEADERS,
+            json={"selected_option": "A"},
+        )
+        assert attempt.status_code == 200
+        correction_request = client.post(
+            "/v1/learning/practice-correction-requests",
+            headers=_LEARNER_HEADERS,
+            json={"record_id": attempt.json()["record_id"], "reason": "需要重发布"},
+        )
+        assert correction_request.status_code == 200
+        request_id = correction_request.json()["request_id"]
+        assert client.post(
+            f"/v1/admin/practice-correction-requests/{request_id}/resolution",
+            headers=_ADMIN_HEADERS,
+            json={"resolution": "republication_required"},
+        ).status_code == 200
+        second_payload = {
+            **_publish_payload(question_id, "content-v2"),
+            "stem": f"{question_id} 的巡检新版题干",
+        }
+        _prepare_and_approve(client, second_payload)
+        assert client.post(
+            "/v1/admin/questions",
+            headers=_ADMIN_HEADERS,
+            json=second_payload,
+        ).status_code == 200
+        assert client.post(
+            f"/v1/admin/questions/{question_id}/content-v2/"
+            "correction-republication-links",
+            headers=_ADMIN_HEADERS,
+            json={"request_id": request_id, "previous_content_version": "content-v1"},
+        ).status_code == 200
+
+    assert client.post(
+        "/v1/admin/questions/q-2/content-v2/deactivation",
+        headers=_ADMIN_HEADERS,
+        json={"reason": "巡检异常投影测试"},
+    ).status_code == 200
+    first_page = client.get(
+        "/v1/admin/practice-correction-reconciliations?limit=1",
+        headers=_ADMIN_HEADERS,
+    )
+    second_page = client.get(
+        "/v1/admin/practice-correction-reconciliations?limit=1&offset=1",
+        headers=_ADMIN_HEADERS,
+    )
+    empty_page = client.get(
+        "/v1/admin/practice-correction-reconciliations?limit=1&offset=2",
+        headers=_ADMIN_HEADERS,
+    )
+
+    assert first_page.status_code == 200
+    first_page_payload = first_page.json()
+    assert first_page_payload["total_linked_audits"] == 2
+    assert first_page_payload["offset"] == 0
+    assert first_page_payload["scanned_linked_audits"] == 1
+    assert first_page_payload["next_offset"] == 1
+    assert second_page.status_code == 200
+    second_page_payload = second_page.json()
+    assert second_page_payload["total_linked_audits"] == 2
+    assert second_page_payload["offset"] == 1
+    assert second_page_payload["scanned_linked_audits"] == 1
+    assert second_page_payload["next_offset"] is None
+    assert (
+        first_page_payload["active_verified_audits"]
+        + second_page_payload["active_verified_audits"]
+        == 1
+    )
+    non_verified_audits = (
+        first_page_payload["non_verified_audits"]
+        + second_page_payload["non_verified_audits"]
+    )
+    assert len(non_verified_audits) == 1
+    assert (
+        non_verified_audits[0]["republication_verification"]["status"]
+        == "historical_inactive"
+    )
+    assert empty_page.status_code == 200
+    assert empty_page.json() == {
+        "total_linked_audits": 2,
+        "offset": 2,
+        "scanned_linked_audits": 0,
+        "active_verified_audits": 0,
+        "next_offset": None,
+        "non_verified_audits": [],
+    }
 
 
 def test_republication_audit_verification_detects_abnormal_cross_store_facts(
@@ -1635,6 +1752,17 @@ def test_admin_correction_audit_routes_return_link_and_complete_event_chain(
         "/v1/admin/practice-correction-audits",
         headers=_LEARNER_HEADERS,
     )
+    unauthenticated_reconciliation = client.get(
+        "/v1/admin/practice-correction-reconciliations"
+    )
+    learner_reconciliation = client.get(
+        "/v1/admin/practice-correction-reconciliations",
+        headers=_LEARNER_HEADERS,
+    )
+    invalid_reconciliation_offset = client.get(
+        "/v1/admin/practice-correction-reconciliations?offset=10001",
+        headers=_ADMIN_HEADERS,
+    )
     exact = client.get(
         f"/v1/admin/practice-correction-audits/{request_id}",
         headers=_ADMIN_HEADERS,
@@ -1663,6 +1791,9 @@ def test_admin_correction_audit_routes_return_link_and_complete_event_chain(
 
     assert unauthenticated.status_code == 401
     assert learner.status_code == 403
+    assert unauthenticated_reconciliation.status_code == 401
+    assert learner_reconciliation.status_code == 403
+    assert invalid_reconciliation_offset.status_code == 422
     assert exact.status_code == 200
     payload = exact.json()
     assert payload["request"]["request_id"] == request_id
@@ -1680,6 +1811,20 @@ def test_admin_correction_audit_routes_return_link_and_complete_event_chain(
     assert payload["republication_verification"] == {
         "status": "active_verified",
         "observed_content_hash": candidate["content_hash"],
+    }
+    reconciliation = client.get(
+        "/v1/admin/practice-correction-reconciliations",
+        headers=_ADMIN_HEADERS,
+    )
+
+    assert reconciliation.status_code == 200
+    assert reconciliation.json() == {
+        "total_linked_audits": 1,
+        "offset": 0,
+        "scanned_linked_audits": 1,
+        "active_verified_audits": 1,
+        "next_offset": None,
+        "non_verified_audits": [],
     }
     assert [event["event_type"] for event in payload["events"]] == [
         "requested",
