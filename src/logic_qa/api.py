@@ -40,11 +40,18 @@ from logic_qa.grouping_matching_solver import (
 )
 from logic_qa.learning_profile import (
     DuplicatePracticeAttemptError,
+    DuplicatePracticeCorrectionRequestError,
     ImmutablePracticeAttemptError,
     LearningProfile,
     LearningProfileStore,
     LearningRecord,
     LearningRecordInput,
+    PracticeCorrectionRequest,
+    PracticeCorrectionRequestAlreadyResolvedError,
+    PracticeCorrectionRequestInput,
+    PracticeCorrectionRequestStatus,
+    PracticeCorrectionResolution,
+    PracticeCorrectionResolutionInput,
 )
 from logic_qa.models import ImplicationRule, Literal, VerificationResult
 from logic_qa.ocr_service import (
@@ -477,6 +484,52 @@ class PracticeAnswerResponse(BaseModel):
     record_id: str
 
 
+class PracticeCorrectionRequestCreateRequest(BaseModel):
+    """学习者对自身不可变练习记录提交的最小复核请求。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    record_id: str
+    reason: str
+
+
+class PracticeCorrectionResolutionRequest(BaseModel):
+    """管理员对一条待处理复核申请提交的终态治理结论。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolution: PracticeCorrectionResolution
+    notes: str | None = None
+
+
+class PracticeCorrectionRequestResponse(BaseModel):
+    """学习者可见的申请状态，不包含管理员、标签或题库内部信息。"""
+
+    request_id: str
+    record_id: str
+    question_id: str
+    content_version: str
+    status: PracticeCorrectionRequestStatus
+    created_at: str
+    resolved_at: str | None
+
+
+class AdminPracticeCorrectionRequestResponse(BaseModel):
+    """管理员处置所需的申请元数据，不返回题目答案或形式化资产。"""
+
+    request_id: str
+    record_id: str
+    user_id: str
+    question_id: str
+    content_version: str
+    reason: str
+    status: PracticeCorrectionRequestStatus
+    created_at: str
+    resolved_by: str | None
+    resolution_notes: str | None
+    resolved_at: str | None
+
+
 class LearningRecordResponse(BaseModel):
     """当前认证用户已持久化的最小学习记录确认。"""
 
@@ -877,6 +930,93 @@ def submit_practice_answer(
     )
 
 
+@app.post(
+    "/v1/learning/practice-correction-requests",
+    response_model=PracticeCorrectionRequestResponse,
+)
+def create_practice_correction_request(
+    request: PracticeCorrectionRequestCreateRequest,
+    identity: CurrentIdentity,
+) -> PracticeCorrectionRequestResponse:
+    """为当前用户自己的不可变练习记录创建一次受控复核申请。"""
+    try:
+        correction_request = learning_store.create_practice_correction_request(
+            PracticeCorrectionRequestInput(
+                user_id=identity.subject,
+                record_id=request.record_id,
+                reason=request.reason,
+            )
+        )
+    except DuplicatePracticeCorrectionRequestError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if correction_request is None:
+        raise HTTPException(
+            status_code=404,
+            detail="未找到属于当前用户的已发布题练习记录",
+        )
+    return _practice_correction_request_to_response(correction_request)
+
+
+@app.get(
+    "/v1/learning/practice-correction-requests",
+    response_model=list[PracticeCorrectionRequestResponse],
+)
+def get_practice_correction_requests(
+    identity: CurrentIdentity,
+) -> list[PracticeCorrectionRequestResponse]:
+    """只读取当前用户自己的受控复核申请状态。"""
+    try:
+        requests = learning_store.list_practice_correction_requests_for_user(
+            identity.subject
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return [_practice_correction_request_to_response(item) for item in requests]
+
+
+@app.get(
+    "/v1/admin/practice-correction-requests",
+    response_model=list[AdminPracticeCorrectionRequestResponse],
+)
+def get_admin_practice_correction_requests(
+    _: AdminIdentity,
+    status: PracticeCorrectionRequestStatus | None = None,
+) -> list[AdminPracticeCorrectionRequestResponse]:
+    """供管理员读取待处理或已处置的申请，不改写原始练习账本。"""
+    requests = learning_store.list_practice_correction_requests(status=status)
+    return [_admin_practice_correction_request_to_response(item) for item in requests]
+
+
+@app.post(
+    "/v1/admin/practice-correction-requests/{request_id}/resolution",
+    response_model=AdminPracticeCorrectionRequestResponse,
+)
+def resolve_practice_correction_request(
+    request_id: str,
+    request: PracticeCorrectionResolutionRequest,
+    identity: AdminIdentity,
+) -> AdminPracticeCorrectionRequestResponse:
+    """以追加式管理员事件终态处置复核申请，不覆盖首次判分。"""
+    try:
+        correction_request = learning_store.resolve_practice_correction_request(
+            PracticeCorrectionResolutionInput(
+                request_id=request_id,
+                resolver_id=identity.subject,
+                resolution=request.resolution,
+                notes=request.notes,
+            )
+        )
+    except PracticeCorrectionRequestAlreadyResolvedError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if correction_request is None:
+        raise HTTPException(status_code=404, detail="未找到复核申请")
+    return _admin_practice_correction_request_to_response(correction_request)
+
+
 @app.delete("/v1/learning/records/{record_id}")
 def delete_learning_record(
     record_id: str,
@@ -1064,6 +1204,40 @@ def _runtime_metrics_to_response(
         average_latency_ms=snapshot.average_latency_ms,
         route_counts=list(snapshot.route_counts),
         status_counts=list(snapshot.status_counts),
+    )
+
+
+def _practice_correction_request_to_response(
+    request: PracticeCorrectionRequest,
+) -> PracticeCorrectionRequestResponse:
+    """将更正申请转换为学习者最小状态视图。"""
+    return PracticeCorrectionRequestResponse(
+        request_id=request.request_id,
+        record_id=request.record_id,
+        question_id=request.question_id,
+        content_version=request.content_version,
+        status=request.status,
+        created_at=request.created_at,
+        resolved_at=request.resolved_at,
+    )
+
+
+def _admin_practice_correction_request_to_response(
+    request: PracticeCorrectionRequest,
+) -> AdminPracticeCorrectionRequestResponse:
+    """将申请转换为管理员处置视图，不附带题目答案或内部形式化资产。"""
+    return AdminPracticeCorrectionRequestResponse(
+        request_id=request.request_id,
+        record_id=request.record_id,
+        user_id=request.user_id,
+        question_id=request.question_id,
+        content_version=request.content_version,
+        reason=request.reason,
+        status=request.status,
+        created_at=request.created_at,
+        resolved_by=request.resolved_by,
+        resolution_notes=request.resolution_notes,
+        resolved_at=request.resolved_at,
     )
 
 
