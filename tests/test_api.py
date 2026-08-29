@@ -7,6 +7,30 @@ from logic_qa.api import app
 client = TestClient(app)
 
 
+def test_learner_home_serves_same_origin_interface() -> None:
+    """根路径应提供仅调用公开中文求解接口的学习者页面。"""
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "可信逻辑答疑" in response.text
+    assert 'action="/v1/questions/solve-chinese"' not in response.text
+    assert "/assets/app.css" in response.text
+    assert "/assets/app.js" in response.text
+    assert "/v1/admin/" not in response.text
+
+
+def test_learner_static_assets_are_available() -> None:
+    """同源页面使用的样式与交互资源应可被浏览器读取。"""
+    stylesheet = client.get("/assets/app.css")
+    script = client.get("/assets/app.js")
+
+    assert stylesheet.status_code == 200
+    assert "--brand" in stylesheet.text
+    assert script.status_code == 200
+    assert 'fetch("/v1/questions/solve-chinese"' in script.text
+    assert "/v1/admin/" not in script.text
+
+
 def test_health_check() -> None:
     """服务应暴露健康检查接口。"""
     response = client.get("/health")

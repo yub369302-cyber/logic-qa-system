@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="使用确定性规则引擎验证受控中文逻辑条件。"
+    />
+    <title>可信逻辑答疑</title>
+    <link rel="stylesheet" href="/assets/app.css" />
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#solver">跳至解题表单</a>
+    <header class="site-header">
+      <div class="page-shell header-content">
+        <a class="brand" href="/" aria-label="可信逻辑答疑首页">可信逻辑答疑</a>
+        <a class="docs-link" href="/docs">接口文档</a>
+      </div>
+    </header>
+
+    <main class="page-shell page-content">
+      <section class="hero" aria-labelledby="page-title">
+        <p class="eyebrow">VERIFIABLE LOGIC</p>
+        <h1 id="page-title">让每一步结论都有可检查的依据</h1>
+        <p class="hero-copy">
+          页面只负责收集条件和展示结果。最终结论由后端确定性规则引擎给出；复杂中文条件不会被页面自行猜测。
+        </p>
+      </section>
+
+      <div class="workspace">
+        <article class="panel solver-panel" id="solver" aria-labelledby="solver-title">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">第一步</p>
+              <h2 id="solver-title">输入受控中文条件</h2>
+            </div>
+            <button class="text-button" id="example-button" type="button">
+              填入示例
+            </button>
+          </div>
+
+          <form id="solve-form" novalidate>
+            <div class="field">
+              <label for="conditions">条件</label>
+              <p class="field-help" id="conditions-help">
+                用句号、分号或换行分隔。可自动识别“如果/若/只要”“只有…才…”和“当且仅当”。
+              </p>
+              <textarea
+                id="conditions"
+                name="conditions"
+                rows="9"
+                required
+                aria-describedby="conditions-help"
+                placeholder="甲参加。若甲参加，则乙通过。只有丙入选，乙才通过。"
+              ></textarea>
+            </div>
+
+            <div class="field">
+              <label for="query">待验证命题</label>
+              <p class="field-help" id="query-help">
+                输入一个不带句末标点的简单命题，例如“丙入选”。
+              </p>
+              <input
+                id="query"
+                name="query"
+                type="text"
+                required
+                aria-describedby="query-help"
+                placeholder="丙入选"
+              />
+            </div>
+
+            <p class="form-error" id="form-error" role="alert" hidden></p>
+            <div class="form-actions">
+              <button class="primary-button" id="solve-button" type="submit">
+                <span class="button-label">开始验证</span>
+                <span class="button-loading" aria-hidden="true">正在验证…</span>
+              </button>
+              <p class="privacy-note">不会调用管理端接口，也不会上传身份信息。</p>
+            </div>
+          </form>
+        </article>
+
+        <aside class="trust-card" aria-labelledby="trust-title">
+          <p class="section-kicker">可信边界</p>
+          <h2 id="trust-title">先确认语义，再给结论</h2>
+          <p>
+            “除非/否则”、析取、合取、量词和非标准否定可能存在多种逻辑含义。遇到这些条件，系统会暂停验证并要求你填写明确的事实或单前提规则。
+          </p>
+          <dl class="trust-list">
+            <div>
+              <dt>可展示为结论</dt>
+              <dd>已完整验证的证明或反证</dd>
+            </div>
+            <div>
+              <dt>不能展示为结论</dt>
+              <dd>语义未确认、条件冲突或超出验证边界的情形</dd>
+            </div>
+          </dl>
+        </aside>
+      </div>
+
+      <section
+        class="confirmation-panel panel"
+        id="confirmation-panel"
+        aria-labelledby="confirmation-title"
+        hidden
+      >
+        <div class="panel-heading">
+          <div>
+            <p class="section-kicker">需要你的确认</p>
+            <h2 id="confirmation-title">将复杂条件转写为结构化信息</h2>
+          </div>
+          <span class="status-badge pending">尚未验证</span>
+        </div>
+        <p class="confirmation-intro">
+          请只填写你确认过的逻辑含义。每一条事实占一行；规则每行使用“前提 -&gt; 结论”，例如“!甲参加 -&gt; 乙通过”。页面不会替你解释原句。
+        </p>
+        <form id="confirmation-form" novalidate>
+          <div id="confirmation-fields"></div>
+          <p class="form-error" id="confirmation-error" role="alert" hidden></p>
+          <div class="form-actions">
+            <button class="primary-button" id="confirmation-submit" type="submit">
+              <span class="button-label">提交确认并重新验证</span>
+              <span class="button-loading" aria-hidden="true">正在验证…</span>
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <section class="result-panel panel" id="result-panel" aria-labelledby="result-title">
+        <div class="panel-heading">
+          <div>
+            <p class="section-kicker">验证结果</p>
+            <h2 id="result-title">等待条件输入</h2>
+          </div>
+          <span class="status-badge neutral" id="result-badge">未开始</span>
+        </div>
+        <p class="result-summary" id="result-summary" aria-live="polite">
+          提交条件后，这里会显示后端返回的验证等级、解析结果和证明轨迹。
+        </p>
+        <div class="result-details" id="result-details" hidden></div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="page-shell">
+        <p>可信逻辑答疑 MVP · 结论来自可复算规则，而非页面生成。</p>
+      </div>
+    </footer>
+  </body>
+</html>
