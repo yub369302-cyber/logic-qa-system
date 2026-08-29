@@ -1062,7 +1062,7 @@ def _verified_republished_content_version(
     )
     if republication is None:
         return None
-    published = question_bank_store.get_published_question(
+    published = question_bank_store.get_active_published_question(
         outcome.question_id,
         republication.new_content_version,
     )

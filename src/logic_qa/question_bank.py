@@ -62,6 +62,13 @@ class FormalizationKind(StrEnum):
     MATCHING = "matching"
 
 
+class QuestionVersionLifecycleAction(StrEnum):
+    """已发布版本可由管理员追加的受控生命周期动作。"""
+
+    DEACTIVATED = "deactivated"
+    REACTIVATED = "reactivated"
+
+
 @dataclass(frozen=True, slots=True)
 class FormalizationRule:
     """候选题形式化资产中的单前提蕴含规则。"""
@@ -229,6 +236,21 @@ class PublishedQuestion:
 
 
 @dataclass(frozen=True, slots=True)
+class QuestionVersionLifecycleEvent:
+    """下线或重新激活已发布版本时追加的不可变治理事件。"""
+
+    event_id: str
+    question_id: str
+    content_version: str
+    content_hash: str
+    action: QuestionVersionLifecycleAction
+    actor_id: str
+    replaced_content_version: str | None
+    reason: str
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class LearnerQuestion:
     """学习者可见题目，不包含审核、答案、摘要或内部标签。"""
 
@@ -270,6 +292,11 @@ class QuestionBankStore:
                     1,
                     "create_versioned_question_bank",
                     self._migrate_v1,
+                ),
+                DatabaseMigration(
+                    2,
+                    "add_question_version_lifecycle_events",
+                    self._migrate_v2,
                 ),
             ),
         )
@@ -479,35 +506,11 @@ class QuestionBankStore:
                     question.published_at,
                 ),
             )
-            connection.execute(
-                """
-                INSERT INTO question_formalization_verification_events (
-                    event_id, question_id, content_version, content_hash,
-                    formalization_version, formalization_kind, expected_status,
-                    actual_status, expected_solution_count, actual_solution_count,
-                    proof_steps, known_literals, conflict, evidence, selected_option,
-                    matching_options, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(uuid4()),
-                    question.question_id,
-                    question.content_version,
-                    question.content_hash,
-                    question.formalization_version,
-                    verification.kind.value,
-                    verification.expected_status.value,
-                    verification.actual_status.value,
-                    verification.expected_solution_count,
-                    verification.actual_solution_count,
-                    _serialize_proof_steps(verification.proof_steps),
-                    _serialize_literals(verification.known_literals),
-                    _serialize_conflict(verification.conflict),
-                    verification.evidence,
-                    verification.selected_option,
-                    _serialize_values(verification.matching_options),
-                    question.published_at,
-                ),
+            _insert_formalization_verification_event(
+                connection,
+                question=question,
+                verification=verification,
+                created_at=question.published_at,
             )
         return question
 
@@ -575,6 +578,175 @@ class QuestionBankStore:
                 (normalized_question_id, normalized_content_version),
             ).fetchone()
         return _question_from_row(row) if row else None
+
+    def deactivate_active_version(
+        self,
+        question_id: str,
+        content_version: str,
+        *,
+        actor_id: str,
+        reason: str,
+    ) -> QuestionVersionLifecycleEvent | None:
+        """下线当前活动版本并追加治理事件，不删除历史版本或审计事实。"""
+        normalized_question_id = _validate_text(question_id, "题目标识", max_length=128)
+        normalized_content_version = _validate_text(
+            content_version,
+            "内容版本",
+            max_length=128,
+        )
+        normalized_actor_id = _validate_text(actor_id, "操作人标识", max_length=128)
+        normalized_reason = _validate_text(reason, "下线原因", max_length=2_000)
+        created_at = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT question_id, content_version, content_hash, question_type, stem,
+                       options, error_tags, knowledge_tags, formalization_version,
+                       formalization, published_at, is_active
+                FROM question_versions
+                WHERE question_id = ? AND content_version = ?
+                """,
+                (normalized_question_id, normalized_content_version),
+            ).fetchone()
+            if row is None:
+                return None
+            if not row["is_active"]:
+                raise ValueError("该题目版本当前未活动，不能下线")
+            question = _question_from_row(row)
+            cursor = connection.execute(
+                """
+                UPDATE question_versions
+                SET is_active = 0
+                WHERE question_id = ? AND content_version = ? AND is_active = 1
+                """,
+                (normalized_question_id, normalized_content_version),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("该题目版本活动状态已变化，请重新查询")
+            event = _insert_question_version_lifecycle_event(
+                connection,
+                question=question,
+                action=QuestionVersionLifecycleAction.DEACTIVATED,
+                actor_id=normalized_actor_id,
+                replaced_content_version=None,
+                reason=normalized_reason,
+                created_at=created_at,
+            )
+        return event
+
+    def reactivate_published_version(
+        self,
+        question_id: str,
+        content_version: str,
+        *,
+        actor_id: str,
+        reason: str,
+        review: QuestionReviewRecord | None,
+    ) -> QuestionVersionLifecycleEvent | None:
+        """复核既有候选、审核和形式化资产后重新激活历史发布版本。"""
+        normalized_question_id = _validate_text(question_id, "题目标识", max_length=128)
+        normalized_content_version = _validate_text(
+            content_version,
+            "内容版本",
+            max_length=128,
+        )
+        normalized_actor_id = _validate_text(actor_id, "操作人标识", max_length=128)
+        normalized_reason = _validate_text(reason, "重新激活原因", max_length=2_000)
+        question = self.get_published_question(
+            normalized_question_id,
+            normalized_content_version,
+        )
+        if question is None:
+            return None
+        candidate = self.get_candidate(
+            question.question_id,
+            question.content_version,
+            question.content_hash,
+        )
+        if candidate is None:
+            raise ValueError("已发布版本缺少精确候选快照，不能重新激活")
+        _validate_candidate_matches_published_question(candidate, question)
+        verification = self.verify_candidate_formalization(candidate)
+        self._validate_formalization_verification(verification)
+        verification = self._evaluate_option_semantics(candidate, verification)
+        self._validate_review(candidate, review)
+        created_at = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            target = connection.execute(
+                """
+                SELECT is_active
+                FROM question_versions
+                WHERE question_id = ? AND content_version = ?
+                """,
+                (normalized_question_id, normalized_content_version),
+            ).fetchone()
+            if target is None:
+                return None
+            if target["is_active"]:
+                raise ValueError("该题目版本当前已活动，无需重新激活")
+            active_rows = connection.execute(
+                """
+                SELECT content_version
+                FROM question_versions
+                WHERE question_id = ? AND is_active = 1
+                ORDER BY content_version ASC
+                """,
+                (normalized_question_id,),
+            ).fetchall()
+            if len(active_rows) > 1:
+                raise ValueError("该题目存在多个活动版本，拒绝执行重新激活")
+            replaced_content_version = (
+                active_rows[0]["content_version"] if active_rows else None
+            )
+            connection.execute(
+                "UPDATE question_versions SET is_active = 0 WHERE question_id = ?",
+                (normalized_question_id,),
+            )
+            cursor = connection.execute(
+                """
+                UPDATE question_versions
+                SET is_active = 1
+                WHERE question_id = ? AND content_version = ? AND is_active = 0
+                """,
+                (normalized_question_id, normalized_content_version),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("该题目版本活动状态已变化，请重新查询")
+            _insert_formalization_verification_event(
+                connection,
+                question=question,
+                verification=verification,
+                created_at=created_at,
+            )
+            event = _insert_question_version_lifecycle_event(
+                connection,
+                question=question,
+                action=QuestionVersionLifecycleAction.REACTIVATED,
+                actor_id=normalized_actor_id,
+                replaced_content_version=replaced_content_version,
+                reason=normalized_reason,
+                created_at=created_at,
+            )
+        return event
+
+    def list_question_version_lifecycle_events(
+        self,
+        question_id: str,
+    ) -> tuple[QuestionVersionLifecycleEvent, ...]:
+        """按题号回查下线与重新激活的不可变治理事件。"""
+        normalized_question_id = _validate_text(question_id, "题目标识", max_length=128)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT event_id, question_id, content_version, content_hash, action,
+                       actor_id, replaced_content_version, reason, created_at
+                FROM question_version_lifecycle_events
+                WHERE question_id = ?
+                ORDER BY created_at ASC, rowid ASC
+                """,
+                (normalized_question_id,),
+            ).fetchall()
+        return tuple(_question_version_lifecycle_event_from_row(row) for row in rows)
 
     def get_active_learner_question(
         self,
@@ -836,6 +1008,30 @@ class QuestionBankStore:
             MatchingSolveStatus.UNSATISFIABLE,
         }:
             raise ValueError("形式化约束无解，不能发布")
+
+    def _migrate_v2(self, connection: sqlite3.Connection) -> None:
+        """为已发布版本添加下线与重新激活的追加式治理审计表。"""
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS question_version_lifecycle_events (
+                event_id TEXT PRIMARY KEY,
+                question_id TEXT NOT NULL,
+                content_version TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                action TEXT NOT NULL CHECK (action IN ('deactivated', 'reactivated')),
+                actor_id TEXT NOT NULL,
+                replaced_content_version TEXT,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_question_version_lifecycle_events_q_created
+            ON question_version_lifecycle_events (question_id, created_at)
+            """
+        )
 
     def _migrate_v1(self, connection: sqlite3.Connection) -> None:
         """建立候选、版本、发布与形式化验证审计表。"""
@@ -2110,6 +2306,90 @@ def _deserialize_conflict(value: str | None) -> tuple[Literal, Literal] | None:
     return conflict[0], conflict[1]
 
 
+def _insert_formalization_verification_event(
+    connection: sqlite3.Connection,
+    *,
+    question: PublishedQuestion,
+    verification: FormalizationVerification,
+    created_at: str,
+) -> None:
+    """追加一次形式化复验事实，供发布和历史版本重激活共同审计。"""
+    connection.execute(
+        """
+        INSERT INTO question_formalization_verification_events (
+            event_id, question_id, content_version, content_hash,
+            formalization_version, formalization_kind, expected_status,
+            actual_status, expected_solution_count, actual_solution_count,
+            proof_steps, known_literals, conflict, evidence, selected_option,
+            matching_options, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(uuid4()),
+            question.question_id,
+            question.content_version,
+            question.content_hash,
+            question.formalization_version,
+            verification.kind.value,
+            verification.expected_status.value,
+            verification.actual_status.value,
+            verification.expected_solution_count,
+            verification.actual_solution_count,
+            _serialize_proof_steps(verification.proof_steps),
+            _serialize_literals(verification.known_literals),
+            _serialize_conflict(verification.conflict),
+            verification.evidence,
+            verification.selected_option,
+            _serialize_values(verification.matching_options),
+            created_at,
+        ),
+    )
+
+
+def _insert_question_version_lifecycle_event(
+    connection: sqlite3.Connection,
+    *,
+    question: PublishedQuestion,
+    action: QuestionVersionLifecycleAction,
+    actor_id: str,
+    replaced_content_version: str | None,
+    reason: str,
+    created_at: str,
+) -> QuestionVersionLifecycleEvent:
+    """写入版本状态变更的不可变审计事实，并返回刚创建的事件。"""
+    event = QuestionVersionLifecycleEvent(
+        event_id=str(uuid4()),
+        question_id=question.question_id,
+        content_version=question.content_version,
+        content_hash=question.content_hash,
+        action=action,
+        actor_id=actor_id,
+        replaced_content_version=replaced_content_version,
+        reason=reason,
+        created_at=created_at,
+    )
+    connection.execute(
+        """
+        INSERT INTO question_version_lifecycle_events (
+            event_id, question_id, content_version, content_hash, action, actor_id,
+            replaced_content_version, reason, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event.event_id,
+            event.question_id,
+            event.content_version,
+            event.content_hash,
+            event.action.value,
+            event.actor_id,
+            event.replaced_content_version,
+            event.reason,
+            event.created_at,
+        ),
+    )
+    return event
+
+
 def _formalization_verification_event_from_row(
     row: sqlite3.Row,
 ) -> FormalizationVerificationEvent:
@@ -2207,6 +2487,50 @@ def _deserialize_values(value: str) -> tuple[str, ...]:
     if not is_string_list:
         raise ValueError("题库数据格式不合法")
     return tuple(loaded)
+
+
+def _validate_candidate_matches_published_question(
+    candidate: QuestionCandidate,
+    question: PublishedQuestion,
+) -> None:
+    """拒绝缺失、漂移或伪造的候选快照重新激活历史发布版本。"""
+    expected_publication = QuestionPublicationInput(
+        question_id=question.question_id,
+        content_version=question.content_version,
+        question_type=question.question_type,
+        stem=question.stem,
+        options=question.options,
+        error_tags=question.error_tags,
+        knowledge_tags=question.knowledge_tags,
+        formalization_version=question.formalization_version,
+        formalization=question.formalization,
+    )
+    if candidate.publication != expected_publication:
+        raise ValueError("候选快照与已发布版本不一致，不能重新激活")
+    if candidate.content_hash != question.content_hash:
+        raise ValueError("候选快照摘要与已发布版本不一致，不能重新激活")
+    if _content_hash_for(candidate.publication) != candidate.content_hash:
+        raise ValueError("候选快照内容摘要校验失败，不能重新激活")
+
+
+def _question_version_lifecycle_event_from_row(
+    row: sqlite3.Row,
+) -> QuestionVersionLifecycleEvent:
+    try:
+        action = QuestionVersionLifecycleAction(row["action"])
+    except ValueError as error:
+        raise ValueError("题目版本生命周期动作格式不合法") from error
+    return QuestionVersionLifecycleEvent(
+        event_id=row["event_id"],
+        question_id=row["question_id"],
+        content_version=row["content_version"],
+        content_hash=row["content_hash"],
+        action=action,
+        actor_id=row["actor_id"],
+        replaced_content_version=row["replaced_content_version"],
+        reason=row["reason"],
+        created_at=row["created_at"],
+    )
 
 
 def _candidate_from_row(row: sqlite3.Row) -> QuestionCandidate:

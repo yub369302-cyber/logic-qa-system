@@ -48,6 +48,8 @@ from logic_qa.question_bank import (
     QuestionCandidate,
     QuestionFormalization,
     QuestionPublicationInput,
+    QuestionVersionLifecycleAction,
+    QuestionVersionLifecycleEvent,
 )
 
 router = APIRouter(prefix="/v1/admin", tags=["question-bank"])
@@ -305,6 +307,28 @@ class AdminPublishedQuestionResponse(QuestionCandidateResponse):
     published_at: str
 
 
+class QuestionVersionLifecycleRequest(BaseModel):
+    """管理员触发下线或历史版本重新激活时必须提交的治理理由。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str
+
+
+class QuestionVersionLifecycleEventResponse(BaseModel):
+    """管理员可回查的版本下线或重新激活审计事实。"""
+
+    event_id: str
+    question_id: str
+    content_version: str
+    content_hash: str
+    action: QuestionVersionLifecycleAction
+    actor_id: str
+    replaced_content_version: str | None
+    reason: str
+    created_at: str
+
+
 class CorrectionRepublicationLinkRequest(BaseModel):
     """管理员将需要重新发布的申请绑定到已通过门禁的新发布版本。"""
 
@@ -483,6 +507,88 @@ def publish_question(
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     return _admin_published_question_to_response(question)
+
+
+@router.post(
+    "/questions/{question_id}/{content_version}/deactivation",
+    response_model=QuestionVersionLifecycleEventResponse,
+)
+def deactivate_question_version(
+    question_id: str,
+    content_version: str,
+    request: QuestionVersionLifecycleRequest,
+    identity: AdminIdentity,
+    dependencies: QuestionBankDependenciesInput,
+) -> QuestionVersionLifecycleEventResponse:
+    """仅下线当前活动版本；历史发布、验证与学习账本均不改写。"""
+    try:
+        event = dependencies.question_bank_store.deactivate_active_version(
+            question_id,
+            content_version,
+            actor_id=identity.subject,
+            reason=request.reason,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if event is None:
+        raise HTTPException(status_code=404, detail="未找到已发布题目版本")
+    return _question_version_lifecycle_event_to_response(event)
+
+
+@router.post(
+    "/questions/{question_id}/{content_version}/reactivation",
+    response_model=QuestionVersionLifecycleEventResponse,
+)
+def reactivate_question_version(
+    question_id: str,
+    content_version: str,
+    request: QuestionVersionLifecycleRequest,
+    identity: AdminIdentity,
+    dependencies: QuestionBankDependenciesInput,
+) -> QuestionVersionLifecycleEventResponse:
+    """仅在历史版本仍通过精确审核与确定性复验后重新激活。"""
+    try:
+        published = dependencies.question_bank_store.get_published_question(
+            question_id,
+            content_version,
+        )
+        if published is None:
+            raise HTTPException(status_code=404, detail="未找到已发布题目版本")
+        review = dependencies.review_store.get_review(
+            published.question_id,
+            published.content_version,
+            published.content_hash,
+        )
+        event = dependencies.question_bank_store.reactivate_published_version(
+            question_id,
+            content_version,
+            actor_id=identity.subject,
+            reason=request.reason,
+            review=review,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if event is None:
+        raise HTTPException(status_code=404, detail="未找到已发布题目版本")
+    return _question_version_lifecycle_event_to_response(event)
+
+
+@router.get(
+    "/questions/{question_id}/version-lifecycle-events",
+    response_model=list[QuestionVersionLifecycleEventResponse],
+)
+def list_question_version_lifecycle_events(
+    question_id: str,
+    _: AdminIdentity,
+    dependencies: QuestionBankDependenciesInput,
+) -> list[QuestionVersionLifecycleEventResponse]:
+    """回查同一题目全部下线与重新激活事件，不读取或修改学习账本。"""
+    try:
+        store = dependencies.question_bank_store
+        events = store.list_question_version_lifecycle_events(question_id)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return [_question_version_lifecycle_event_to_response(event) for event in events]
 
 
 @router.post(
@@ -741,6 +847,23 @@ def _option_assertions_to_response(
         )
         for assertion in assertions
     ]
+
+
+def _question_version_lifecycle_event_to_response(
+    event: QuestionVersionLifecycleEvent,
+) -> QuestionVersionLifecycleEventResponse:
+    """将不可变版本状态变更事件转换为管理员响应。"""
+    return QuestionVersionLifecycleEventResponse(
+        event_id=event.event_id,
+        question_id=event.question_id,
+        content_version=event.content_version,
+        content_hash=event.content_hash,
+        action=event.action,
+        actor_id=event.actor_id,
+        replaced_content_version=event.replaced_content_version,
+        reason=event.reason,
+        created_at=event.created_at,
+    )
 
 
 def _correction_republication_link_to_response(

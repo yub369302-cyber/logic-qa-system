@@ -183,6 +183,14 @@ API 适配层按职责拆分：`api.py` 负责应用装配、通用求解、学�
 
 该接口仅限具备管理角色的受信身份调用，因此管理员可追溯申请理由、处置人、处置备注、关联人、关联版本与内容摘要；学习者接口继续维持最小安全投影，不能访问该审计视图或其中的治理字段。查询标识为空、分页数量超出 1 至 100 的范围，或单条申请不存在时都会明确拒绝，不会放宽筛选条件或回退到其他记录。
 
+### 阶段 7.10：受控版本下线与回滚治理
+
+管理员可通过 `POST /v1/admin/questions/{question_id}/{content_version}/deactivation` 下线当前活动版本，并必须提交明确的治理理由。下线只将该版本从学习者读取、推荐和判分路径中移除；题目的历史发布记录、候选快照、审核记录、形式化验证事件、学习账本及既有复核关联均不删除、不覆盖。题目可以暂时处于没有活动版本的状态，此时学习者无法读取或提交该题，但历史练习的首次判分和版本去重约束仍然有效。
+
+历史版本可通过 `POST /v1/admin/questions/{question_id}/{content_version}/reactivation` 受控重新激活。该操作不创建新 `content_version`，不改写原始 `published_at`，也不伪装成新的发布；在切换活动版本前，服务会精确回读该历史发布版本的不可变候选快照和当前审核记录，要求审核仍为精确绑定的 `approved`，重新运行确定性形式化验证和全部选项语义门禁，并为本次复验追加新的验证事件。若同题存在另一活动版本，重新激活会原子地下线它并在审计事件中记录被替代版本；若审核已撤销、候选快照缺失或复验失败，操作明确拒绝，原活动版本保持不变。
+
+题库迁移 v2 新增追加式 `question_version_lifecycle_events`，审计记录包含动作、题目与版本、内容摘要、受信管理员身份、被替代版本、理由和时间。管理员可通过 `GET /v1/admin/questions/{question_id}/version-lifecycle-events` 回查完整事件链；学习者不能访问该端点，也不会看到治理理由、内容摘要或管理员身份。该能力与更正申请重发布关联保持兼容：重新激活的历史版本不会被当作新的重发布版本，且已关联的新版本若不再活动，既有学习者投影会继续按题库的精确发布事实安全降级。
+
 ## 快速启动
 
 ```powershell
@@ -225,6 +233,6 @@ uv run python -m compileall -q src tests
 
 ## 主要接口与部署配置
 
-主要接口包括：`POST /v1/questions/solve` 用于结构化命题推理，`POST /v1/questions/solve-chinese` 用于中文条件解析、确认请求和确认后求解，`POST /v1/questions/verify-choice` 用于选择题选项验证，`POST /v1/questions/solve-ordering`、`solve-grouping` 和 `solve-matching` 用于组合约束题，`POST /v1/questions/ocr` 与 `/ocr/correct` 用于图片文字校正，`POST /v1/questions/review-solution` 用于结构化步骤批改，以及 `/v1/learning/*` 用于用户最小学习档案。`POST /v1/learning/practice-correction-requests` 允许学习者为自己的不可变发布题练习记录提交一次复核，`GET` 同一路径仅返回其最小申请状态；`GET /v1/learning/practice-correction-outcomes` 返回不含内部信息的派生处置说明。管理员可通过 `GET /v1/admin/practice-correction-requests` 查看申请，并以 `POST /v1/admin/practice-correction-requests/{request_id}/resolution` 追加终态处置；只有新版本已发布且活动时，才可通过 `POST /v1/admin/questions/{question_id}/{content_version}/correction-republication-links` 将 `republication_required` 申请显式关联到该版本。`GET /v1/admin/practice-correction-audits` 及其单申请路径提供仅管理员可见的关联和事件链审计查询。管理端的 `POST /v1/admin/question-candidates` 需提交完整形式化资产，`GET /v1/admin/question-candidates/{question_id}/{content_version}/{content_hash}` 可精确回查候选快照，`POST /v1/admin/questions` 会在发布前复算并记录形式化验证依据。
+主要接口包括：`POST /v1/questions/solve` 用于结构化命题推理，`POST /v1/questions/solve-chinese` 用于中文条件解析、确认请求和确认后求解，`POST /v1/questions/verify-choice` 用于选择题选项验证，`POST /v1/questions/solve-ordering`、`solve-grouping` 和 `solve-matching` 用于组合约束题，`POST /v1/questions/ocr` 与 `/ocr/correct` 用于图片文字校正，`POST /v1/questions/review-solution` 用于结构化步骤批改，以及 `/v1/learning/*` 用于用户最小学习档案。`POST /v1/learning/practice-correction-requests` 允许学习者为自己的不可变发布题练习记录提交一次复核，`GET` 同一路径仅返回其最小申请状态；`GET /v1/learning/practice-correction-outcomes` 返回不含内部信息的派生处置说明。管理员可通过 `GET /v1/admin/practice-correction-requests` 查看申请，并以 `POST /v1/admin/practice-correction-requests/{request_id}/resolution` 追加终态处置；只有新版本已发布且活动时，才可通过 `POST /v1/admin/questions/{question_id}/{content_version}/correction-republication-links` 将 `republication_required` 申请显式关联到该版本。`GET /v1/admin/practice-correction-audits` 及其单申请路径提供仅管理员可见的关联和事件链审计查询。管理端的 `POST /v1/admin/question-candidates` 需提交完整形式化资产，`GET /v1/admin/question-candidates/{question_id}/{content_version}/{content_hash}` 可精确回查候选快照，`POST /v1/admin/questions` 会在发布前复算并记录形式化验证依据。已发布活动版本可使用 `POST /v1/admin/questions/{question_id}/{content_version}/deactivation` 受控下线；历史已发布版本可使用对应的 `/reactivation` 在当前精确审核及确定性复验仍通过后重新激活；`GET /v1/admin/questions/{question_id}/version-lifecycle-events` 仅供管理员回查不可变的版本治理事件。
 
 部署可通过 `LOGIC_QA_DATABASE_PATH`、`LOGIC_QA_REVIEW_DATABASE_PATH` 和 `LOGIC_QA_QUESTION_DATABASE_PATH` 指定 SQLite 文件路径。认证接口必须配置 `LOGIC_QA_TRUSTED_PROXY_TOKEN`；前置可信代理完成上游登录后，向服务注入 `X-Logic-QA-Proxy-Token`、`X-Logic-QA-Subject` 与 `X-Logic-QA-Roles`。学习者接口不再接收路径、查询参数或请求体中的用户标识，审核人与发布人也由认证主体自动写入。未配置代理密钥时身份相关接口默认关闭。OCR 默认依赖本地 Tesseract，未安装时会返回 503 和明确说明，不会伪造识别结果。

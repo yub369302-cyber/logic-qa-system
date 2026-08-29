@@ -1,5 +1,6 @@
 """内容绑定审核题库发布与个人练习推荐的回归测试。"""
 
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -677,6 +678,231 @@ def test_new_version_deactivates_old_version_but_keeps_history(tmp_path: Path) -
     assert question_store.active_questions() == (second,)
 
 
+def test_deactivation_and_reactivation_preserve_history_and_append_events(
+    tmp_path: Path,
+) -> None:
+    """下线和回滚只变更活动指针，保留发布事实并追加可审计复验记录。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    first_candidate, first_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    second_candidate, second_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v2", stem="q-1 的新版本题干"),
+    )
+    first = question_store.publish(first_candidate, "publisher-a", first_review)
+    second = question_store.publish(second_candidate, "publisher-a", second_review)
+
+    deactivated = question_store.deactivate_active_version(
+        "q-1",
+        "content-v2",
+        actor_id="admin-a",
+        reason="发现题干表述需要暂时下线",
+    )
+
+    assert deactivated is not None
+    assert deactivated.action.value == "deactivated"
+    assert deactivated.content_hash == second.content_hash
+    assert deactivated.actor_id == "admin-a"
+    assert deactivated.replaced_content_version is None
+    assert question_store.active_questions() == ()
+    assert question_store.get_published_question("q-1", "content-v1") == first
+    assert question_store.get_published_question("q-1", "content-v2") == second
+    assert question_store.get_active_learner_question("q-1", "content-v2") is None
+    assert question_store.grade_active_learner_answer("q-1", "content-v2", "B") is None
+
+    reactivated = question_store.reactivate_published_version(
+        "q-1",
+        "content-v1",
+        actor_id="admin-b",
+        reason="复验历史版本后执行受控回滚",
+        review=review_store.get_review(
+            first.question_id,
+            first.content_version,
+            first.content_hash,
+        ),
+    )
+
+    assert reactivated is not None
+    assert reactivated.action.value == "reactivated"
+    assert reactivated.content_hash == first.content_hash
+    assert reactivated.actor_id == "admin-b"
+    assert reactivated.replaced_content_version is None
+    assert question_store.active_questions() == (first,)
+    assert question_store.get_active_learner_question("q-1", "content-v1") is not None
+    assert (
+        question_store.grade_active_learner_answer("q-1", "content-v1", "B")
+        is not None
+    )
+    assert question_store.get_published_question("q-1", "content-v2") == second
+    assert question_store.list_question_version_lifecycle_events("q-1") == (
+        deactivated,
+        reactivated,
+    )
+    with question_store._connect() as connection:
+        verification_count = connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM question_formalization_verification_events
+            WHERE question_id = ? AND content_version = ? AND content_hash = ?
+            """,
+            (first.question_id, first.content_version, first.content_hash),
+        ).fetchone()["count"]
+    assert verification_count == 2
+
+
+def test_reactivation_replaces_current_version_after_revalidation(
+    tmp_path: Path,
+) -> None:
+    """回滚可替换另一活动版本，但必须保留其历史记录并在事件中指明替代版本。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    first_candidate, first_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    second_candidate, second_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v2", stem="q-1 的新版本题干"),
+    )
+    first = question_store.publish(first_candidate, "publisher-a", first_review)
+    second = question_store.publish(second_candidate, "publisher-a", second_review)
+
+    reactivated = question_store.reactivate_published_version(
+        "q-1",
+        "content-v1",
+        actor_id="admin-a",
+        reason="审核确认回滚到历史版本",
+        review=review_store.get_review(
+            first.question_id,
+            first.content_version,
+            first.content_hash,
+        ),
+    )
+
+    assert reactivated is not None
+    assert reactivated.action.value == "reactivated"
+    assert reactivated.replaced_content_version == second.content_version
+    assert question_store.active_questions() == (first,)
+    assert question_store.get_active_published_question("q-1", "content-v2") is None
+    assert question_store.get_published_question("q-1", "content-v2") == second
+
+
+def test_reactivation_requires_current_exact_approval_and_immutable_candidate(
+    tmp_path: Path,
+) -> None:
+    """历史版本重新上线不能绕过当前审核状态或精确候选快照。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    first_candidate, first_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    second_candidate, second_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v2"),
+    )
+    first = question_store.publish(first_candidate, "publisher-a", first_review)
+    question_store.publish(second_candidate, "publisher-a", second_review)
+    stale_review = review_store.upsert_review(
+        QuestionReviewInput(
+            question_id=first.question_id,
+            content_version=first.content_version,
+            content_hash=first.content_hash,
+            reviewer_id="reviewer-b",
+            status=QuestionReviewStatus.NEEDS_REVISION,
+            verified_answer=None,
+            formalization_version=first.formalization_version,
+        )
+    )
+
+    with pytest.raises(ValueError, match="未通过审核"):
+        question_store.reactivate_published_version(
+            "q-1",
+            "content-v1",
+            actor_id="admin-a",
+            reason="尝试绕过已更新审核",
+            review=stale_review,
+        )
+    assert question_store.active_questions()[0].content_version == "content-v2"
+
+    with question_store._connect() as connection:
+        connection.execute(
+            """
+            DELETE FROM question_candidates
+            WHERE question_id = ? AND content_version = ? AND content_hash = ?
+            """,
+            (first.question_id, first.content_version, first.content_hash),
+        )
+    with pytest.raises(ValueError, match="缺少精确候选快照"):
+        question_store.reactivate_published_version(
+            "q-1",
+            "content-v1",
+            actor_id="admin-a",
+            reason="尝试绕过候选快照",
+            review=stale_review,
+        )
+    assert question_store.active_questions()[0].content_version == "content-v2"
+
+
+def test_version_lifecycle_operations_validate_state_and_identifiers(
+    tmp_path: Path,
+) -> None:
+    """生命周期治理拒绝空标识、空理由、缺失版本和重复状态切换。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    candidate, review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    question_store.publish(candidate, "publisher-a", review)
+
+    with pytest.raises(ValueError, match="下线原因不能为空"):
+        question_store.deactivate_active_version(
+            "q-1",
+            "content-v1",
+            actor_id="admin-a",
+            reason=" ",
+        )
+    assert question_store.deactivate_active_version(
+        "q-1",
+        "content-v1",
+        actor_id="admin-a",
+        reason="受控下线",
+    ) is not None
+    with pytest.raises(ValueError, match="当前未活动"):
+        question_store.deactivate_active_version(
+            "q-1",
+            "content-v1",
+            actor_id="admin-a",
+            reason="重复下线",
+        )
+    with pytest.raises(ValueError, match="重新激活原因不能为空"):
+        question_store.reactivate_published_version(
+            "q-1",
+            "content-v1",
+            actor_id="admin-a",
+            reason=" ",
+            review=review,
+        )
+    assert question_store.reactivate_published_version(
+        "missing",
+        "content-v1",
+        actor_id="admin-a",
+        reason="不存在版本",
+        review=review,
+    ) is None
+
+
 def test_recommendation_excludes_attempted_questions_and_hides_internal_tags(
     tmp_path: Path,
 ) -> None:
@@ -826,6 +1052,47 @@ def test_recommendation_rejects_invalid_limit(tmp_path: Path) -> None:
         _question_store(tmp_path).recommend(_profile(), (), limit=0)
 
 
+def test_question_store_upgrades_v1_to_lifecycle_governance_schema(
+    tmp_path: Path,
+) -> None:
+    """既有 v1 题库升级时只新增治理审计表，不改写已发布版本。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    candidate, review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    published = question_store.publish(candidate, "publisher-a", review)
+    with question_store._connect() as connection:
+        connection.execute("DROP TABLE question_version_lifecycle_events")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 2")
+
+    upgraded_store = _question_store(tmp_path)
+
+    assert upgraded_store.schema_version() == 2
+    assert upgraded_store.active_questions() == (published,)
+    assert upgraded_store.list_question_version_lifecycle_events("q-1") == ()
+    with sqlite3.connect(tmp_path / "questions.sqlite3") as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(question_version_lifecycle_events)"
+            )
+        }
+    assert columns == {
+        "event_id",
+        "question_id",
+        "content_version",
+        "content_hash",
+        "action",
+        "actor_id",
+        "replaced_content_version",
+        "reason",
+        "created_at",
+    }
+
+
 def test_question_store_restores_candidate_publication_and_audit_snapshot(
     tmp_path: Path,
 ) -> None:
@@ -842,6 +1109,21 @@ def test_question_store_restores_candidate_publication_and_audit_snapshot(
         "publisher-a",
         first_review,
     )
+    first_deactivation = question_store.deactivate_active_version(
+        "q-1",
+        "content-v1",
+        actor_id="admin-a",
+        reason="验证备份中的下线审计事件",
+    )
+    first_reactivation = question_store.reactivate_published_version(
+        "q-1",
+        "content-v1",
+        actor_id="admin-a",
+        reason="验证备份中的重新激活审计事件",
+        review=first_review,
+    )
+    assert first_deactivation is not None
+    assert first_reactivation is not None
     backup = question_store.create_backup(tmp_path / "backups")
     second_candidate, second_review = _approved_review(
         review_store,
@@ -852,8 +1134,12 @@ def test_question_store_restores_candidate_publication_and_audit_snapshot(
 
     question_store.restore_backup(question_store.load_backup(backup.manifest_path))
 
-    assert question_store.schema_version() == 1
+    assert question_store.schema_version() == 2
     assert question_store.active_questions() == (first_published,)
+    assert question_store.list_question_version_lifecycle_events("q-1") == (
+        first_deactivation,
+        first_reactivation,
+    )
     verification = question_store.get_formalization_verification(
         first_published.question_id,
         first_published.content_version,
