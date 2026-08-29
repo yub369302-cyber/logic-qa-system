@@ -476,36 +476,32 @@ class PracticeAnswerResponse(BaseModel):
 
 
 class LearningRecordResponse(BaseModel):
-    """当前认证用户已持久化的最小学习记录。"""
+    """当前认证用户已持久化的最小学习记录确认。"""
 
     record_id: str
     question_id: str
     question_type: str
     is_correct: bool
-    error_tags: list[str]
-    knowledge_tags: list[str]
     duration_seconds: int | None
     created_at: str
 
 
-class LearningRecommendationResponse(BaseModel):
-    """基于用户自身历史生成的练习方向。"""
+class LearningFocusResponse(BaseModel):
+    """不含内部标签的学习复盘方向。"""
 
-    focus_type: str
-    label: str
+    kind: str
+    title: str
     reason: str
     suggested_practice: str
 
 
 class LearningProfileResponse(BaseModel):
-    """当前认证用户的学习画像与练习方向。"""
+    """当前认证用户的最小学习概览与安全复盘方向。"""
 
     total_attempts: int
     correct_attempts: int
     accuracy: float | None
-    error_counts: list[tuple[str, int]]
-    knowledge_mastery: list[tuple[str, float]]
-    recommendations: list[LearningRecommendationResponse]
+    focus_areas: list[LearningFocusResponse]
 
 
 class ReviewDiagnosticResponse(BaseModel):
@@ -561,6 +557,12 @@ def learner_home() -> FileResponse:
 def learner_practice_home() -> FileResponse:
     """返回依赖受信代理认证的已发布题库练习页面。"""
     return FileResponse(static_directory / "practice.html")
+
+
+@app.get("/progress")
+def learner_progress_home() -> FileResponse:
+    """返回当前认证学习者的概览与受控复盘页面。"""
+    return FileResponse(static_directory / "progress.html")
 
 
 @app.get("/health")
@@ -1059,14 +1061,12 @@ def _runtime_metrics_to_response(
 
 
 def _learning_record_to_response(record: LearningRecord) -> LearningRecordResponse:
-    """将当前用户的持久化记录转换为 API 输出。"""
+    """确认当前用户的记录已保存，但不返回内部学习标签。"""
     return LearningRecordResponse(
         record_id=record.record_id,
         question_id=record.question_id,
         question_type=record.question_type,
         is_correct=record.is_correct,
-        error_tags=list(record.error_tags),
-        knowledge_tags=list(record.knowledge_tags),
         duration_seconds=record.duration_seconds,
         created_at=record.created_at,
     )
@@ -1075,22 +1075,50 @@ def _learning_record_to_response(record: LearningRecord) -> LearningRecordRespon
 def _learning_profile_to_response(
     profile: LearningProfile,
 ) -> LearningProfileResponse:
-    """将当前用户的学习画像转换为 API 输出。"""
+    """将内部统计转换为不包含原始标签的学习者概览。"""
     return LearningProfileResponse(
         total_attempts=profile.total_attempts,
         correct_attempts=profile.correct_attempts,
         accuracy=profile.accuracy,
-        error_counts=list(profile.error_counts),
-        knowledge_mastery=list(profile.knowledge_mastery),
-        recommendations=[
-            LearningRecommendationResponse(
-                focus_type=item.focus_type,
-                label=item.label,
-                reason=item.reason,
-                suggested_practice=item.suggested_practice,
+        focus_areas=[
+            _learning_focus_to_response(
+                item.focus_type,
+                item.label,
+                item.reason,
+                item.suggested_practice,
             )
             for item in profile.recommendations
         ],
+    )
+
+
+def _learning_focus_to_response(
+    focus_type: str,
+    label: str,
+    reason: str,
+    suggested_practice: str,
+) -> LearningFocusResponse:
+    """将内部标签映射为学习者可读但不可反推内部资产的复盘提示。"""
+    if focus_type == "error_tag":
+        titles = {
+            "invalid_converse": "条件方向核验",
+            "wrong_rule_application": "规则应用核验",
+            "premise_not_established": "前提核验",
+            "invalid_rule_reference": "规则引用核验",
+            "missing_key_step": "推理链完整性",
+        }
+        title = titles.get(label, "推理步骤复盘")
+        return LearningFocusResponse(
+            kind="reasoning_pattern",
+            title=title,
+            reason=reason,
+            suggested_practice=suggested_practice,
+        )
+    return LearningFocusResponse(
+        kind="knowledge_area",
+        title="知识点巩固",
+        reason=reason,
+        suggested_practice=suggested_practice,
     )
 
 

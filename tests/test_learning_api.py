@@ -52,17 +52,39 @@ def test_learning_api_binds_records_profile_and_deletion_to_identity(
 
     assert create_response.status_code == 200
     record = create_response.json()
-    assert "user_id" not in record
-    assert record["error_tags"] == ["invalid_converse"]
+    assert set(record) == {
+        "record_id",
+        "question_id",
+        "question_type",
+        "is_correct",
+        "duration_seconds",
+        "created_at",
+    }
 
     profile_response = client.get("/v1/learning/profile", headers=headers)
 
     assert profile_response.status_code == 200
     profile = profile_response.json()
-    assert "user_id" not in profile
+    assert set(profile) == {
+        "total_attempts",
+        "correct_attempts",
+        "accuracy",
+        "focus_areas",
+    }
     assert profile["total_attempts"] == 1
     assert profile["accuracy"] == 0.0
-    assert profile["recommendations"][0]["label"] == "invalid_converse"
+    assert profile["focus_areas"][0]["title"] == "条件方向核验"
+    for forbidden_field in (
+        "user_id",
+        "error_tags",
+        "knowledge_tags",
+        "error_counts",
+        "knowledge_mastery",
+        "recommendations",
+        "label",
+    ):
+        assert forbidden_field not in profile
+        assert forbidden_field not in profile["focus_areas"][0]
 
     delete_response = client.delete(
         f"/v1/learning/records/{record['record_id']}",
@@ -154,3 +176,32 @@ def test_learning_api_rejects_invalid_record_input(tmp_path: Path, monkeypatch) 
 
     assert response.status_code == 422
     assert response.json()["detail"] == "作答时长不能为负数"
+
+
+def test_learning_profile_masks_unknown_internal_tags(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """未在展示映射表中的内部标签也不能透传到学习者概览。"""
+    client = _client_with_store(tmp_path, monkeypatch)
+    headers = _identity_headers("user-a")
+    create_response = client.post(
+        "/v1/learning/records",
+        headers=headers,
+        json={
+            "question_id": "q-unknown",
+            "question_type": "propositional",
+            "is_correct": False,
+            "error_tags": ["internal-only-tag"],
+            "knowledge_tags": ["内部知识点"],
+        },
+    )
+
+    profile_response = client.get("/v1/learning/profile", headers=headers)
+
+    assert create_response.status_code == 200
+    assert profile_response.status_code == 200
+    profile = profile_response.json()
+    assert profile["focus_areas"][0]["title"] == "推理步骤复盘"
+    assert "internal-only-tag" not in str(profile)
+    assert "内部知识点" not in str(profile)
