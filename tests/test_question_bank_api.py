@@ -722,6 +722,142 @@ def test_practice_attempt_records_are_isolated_per_authenticated_user(
     assert second_user.json()["is_correct"] is True
 
 
+def test_practice_correction_request_is_isolated_and_resolved_without_rewriting_attempt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """申请和管理员处置都受身份保护，且不会重开首次作答或泄露内部信息。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    payload = _publish_payload("q-1", "content-v1")
+    _prepare_and_approve(client, payload)
+    published = client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=payload,
+    )
+    assert published.status_code == 200
+    attempt = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "A"},
+    )
+    assert attempt.status_code == 200
+    record_id = attempt.json()["record_id"]
+
+    invalid_payload = client.post(
+        "/v1/learning/practice-correction-requests",
+        headers=_LEARNER_HEADERS,
+        json={
+            "record_id": record_id,
+            "reason": "请复核服务端判分",
+            "is_correct": True,
+        },
+    )
+    unauthenticated = client.post(
+        "/v1/learning/practice-correction-requests",
+        json={"record_id": record_id, "reason": "请复核服务端判分"},
+    )
+    cross_user = client.post(
+        "/v1/learning/practice-correction-requests",
+        headers={**_LEARNER_HEADERS, "X-Logic-QA-Subject": "user-b"},
+        json={"record_id": record_id, "reason": "请复核服务端判分"},
+    )
+    created = client.post(
+        "/v1/learning/practice-correction-requests",
+        headers=_LEARNER_HEADERS,
+        json={"record_id": record_id, "reason": "请复核服务端判分"},
+    )
+
+    assert invalid_payload.status_code == 422
+    assert unauthenticated.status_code == 401
+    assert cross_user.status_code == 404
+    assert created.status_code == 200
+    learner_request = created.json()
+    assert set(learner_request) == {
+        "request_id",
+        "record_id",
+        "question_id",
+        "content_version",
+        "status",
+        "created_at",
+        "resolved_at",
+    }
+    assert learner_request["status"] == "pending"
+    assert "reason" not in learner_request
+    assert "user_id" not in learner_request
+    assert "resolved_by" not in learner_request
+
+    learner_list = client.get(
+        "/v1/learning/practice-correction-requests",
+        headers=_LEARNER_HEADERS,
+    )
+    other_learner_list = client.get(
+        "/v1/learning/practice-correction-requests",
+        headers={**_LEARNER_HEADERS, "X-Logic-QA-Subject": "user-b"},
+    )
+    learner_admin_list = client.get(
+        "/v1/admin/practice-correction-requests",
+        headers=_LEARNER_HEADERS,
+    )
+    pending_admin_list = client.get(
+        "/v1/admin/practice-correction-requests?status=pending",
+        headers=_ADMIN_HEADERS,
+    )
+
+    assert learner_list.status_code == 200
+    assert learner_list.json() == [learner_request]
+    assert other_learner_list.status_code == 200
+    assert other_learner_list.json() == []
+    assert learner_admin_list.status_code == 403
+    assert pending_admin_list.status_code == 200
+    assert pending_admin_list.json()[0]["reason"] == "请复核服务端判分"
+
+    resolved = client.post(
+        f"/v1/admin/practice-correction-requests/{learner_request['request_id']}/resolution",
+        headers=_ADMIN_HEADERS,
+        json={
+            "resolution": "republication_required",
+            "notes": "原始练习记录保持不变，后续按题库流程复核。",
+        },
+    )
+    duplicate_resolution = client.post(
+        f"/v1/admin/practice-correction-requests/{learner_request['request_id']}/resolution",
+        headers=_ADMIN_HEADERS,
+        json={"resolution": "record_confirmed"},
+    )
+    duplicate_request = client.post(
+        "/v1/learning/practice-correction-requests",
+        headers=_LEARNER_HEADERS,
+        json={"record_id": record_id, "reason": "再次申请"},
+    )
+    repeat_attempt = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "B"},
+    )
+    profile = client.get("/v1/learning/profile", headers=_LEARNER_HEADERS)
+    resolved_learner_list = client.get(
+        "/v1/learning/practice-correction-requests",
+        headers=_LEARNER_HEADERS,
+    )
+
+    assert resolved.status_code == 200
+    assert resolved.json()["status"] == "republication_required"
+    assert resolved.json()["resolved_by"] == "admin-a"
+    assert duplicate_resolution.status_code == 409
+    assert duplicate_resolution.json()["detail"] == "复核申请已完成处置"
+    assert duplicate_request.status_code == 409
+    assert duplicate_request.json()["detail"] == "该练习记录已提交复核申请"
+    assert repeat_attempt.status_code == 409
+    assert repeat_attempt.json()["detail"] == "该题目版本已完成练习，请选择下一题"
+    assert profile.json()["total_attempts"] == 1
+    assert profile.json()["correct_attempts"] == 0
+    assert resolved_learner_list.status_code == 200
+    assert resolved_learner_list.json()[0]["status"] == "republication_required"
+    assert "reason" not in resolved_learner_list.json()[0]
+    assert "resolution_notes" not in resolved_learner_list.json()[0]
+
+
 def test_practice_attempt_record_cannot_be_deleted_by_its_owner(
     tmp_path: Path,
     monkeypatch,

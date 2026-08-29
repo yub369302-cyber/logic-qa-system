@@ -157,6 +157,12 @@ API 适配层按职责拆分：`api.py` 负责应用装配、通用求解、学�
 
 已审核发布题的作答记录既是版本去重依据，也是学习概览的审计来源，因此学习者不能通过通用删除接口删除它们。通用学习记录仍可由所属用户删除；删除请求命中已绑定 `content_version` 的练习账本记录时返回 `409`，记录、版本去重状态和首次作答结果均保持不变。该限制同时避免了用户通过“删除后重做”覆盖服务端判分或重新打开同一发布版本推荐的路径。
 
+### 阶段 7.6：受控练习记录更正申请
+
+练习账本保持不可变，但学习者可以为属于自己的已发布题练习记录提交一次最小复核申请。申请仅包含记录编号和理由，服务端从认证主体和既有账本中绑定用户、题目标识和内容版本；客户端不能提交或覆盖原始对错、正确答案、内部标签、形式化资产或其他用户标识。通用学习记录不能进入该流程，跨用户记录按不存在处理。SQLite 通过 `record_id` 唯一约束与原子 `INSERT OR IGNORE` 防止同一练习记录在并发或重复请求下产生多条申请。
+
+管理员使用独立的管理端接口读取并终态处置申请。当前状态保存在 `practice_correction_requests`，创建与处置同时写入 `practice_correction_events` 追加式审计表；已经处置的申请不能再次覆盖。处置结果仅表示“原记录已确认”或“需要按题库发布流程复核”，不会直接修改 `learning_records` 中的首次服务端判分、版本去重键、学习概览基础或推荐排除状态。学习者只能读取自身申请的最小状态，不会得到管理员身份、处置备注、题库答案或内部形式化信息。
+
 ## 快速启动
 
 ```powershell
@@ -199,6 +205,6 @@ uv run python -m compileall -q src tests
 
 ## 主要接口与部署配置
 
-主要接口包括：`POST /v1/questions/solve` 用于结构化命题推理，`POST /v1/questions/solve-chinese` 用于中文条件解析、确认请求和确认后求解，`POST /v1/questions/verify-choice` 用于选择题选项验证，`POST /v1/questions/solve-ordering`、`solve-grouping` 和 `solve-matching` 用于组合约束题，`POST /v1/questions/ocr` 与 `/ocr/correct` 用于图片文字校正，`POST /v1/questions/review-solution` 用于结构化步骤批改，以及 `/v1/learning/*` 用于用户最小学习档案。管理端的 `POST /v1/admin/question-candidates` 需提交完整形式化资产，`GET /v1/admin/question-candidates/{question_id}/{content_version}/{content_hash}` 可精确回查候选快照，`POST /v1/admin/questions` 会在发布前复算并记录形式化验证依据。
+主要接口包括：`POST /v1/questions/solve` 用于结构化命题推理，`POST /v1/questions/solve-chinese` 用于中文条件解析、确认请求和确认后求解，`POST /v1/questions/verify-choice` 用于选择题选项验证，`POST /v1/questions/solve-ordering`、`solve-grouping` 和 `solve-matching` 用于组合约束题，`POST /v1/questions/ocr` 与 `/ocr/correct` 用于图片文字校正，`POST /v1/questions/review-solution` 用于结构化步骤批改，以及 `/v1/learning/*` 用于用户最小学习档案。`POST /v1/learning/practice-correction-requests` 允许学习者为自己的不可变发布题练习记录提交一次复核，`GET` 同一路径仅返回其最小申请状态；管理员可通过 `GET /v1/admin/practice-correction-requests` 查看申请，并以 `POST /v1/admin/practice-correction-requests/{request_id}/resolution` 追加终态处置。管理端的 `POST /v1/admin/question-candidates` 需提交完整形式化资产，`GET /v1/admin/question-candidates/{question_id}/{content_version}/{content_hash}` 可精确回查候选快照，`POST /v1/admin/questions` 会在发布前复算并记录形式化验证依据。
 
 部署可通过 `LOGIC_QA_DATABASE_PATH`、`LOGIC_QA_REVIEW_DATABASE_PATH` 和 `LOGIC_QA_QUESTION_DATABASE_PATH` 指定 SQLite 文件路径。认证接口必须配置 `LOGIC_QA_TRUSTED_PROXY_TOKEN`；前置可信代理完成上游登录后，向服务注入 `X-Logic-QA-Proxy-Token`、`X-Logic-QA-Subject` 与 `X-Logic-QA-Roles`。学习者接口不再接收路径、查询参数或请求体中的用户标识，审核人与发布人也由认证主体自动写入。未配置代理密钥时身份相关接口默认关闭。OCR 默认依赖本地 Tesseract，未安装时会返回 503 和明确说明，不会伪造识别结果。

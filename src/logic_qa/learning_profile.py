@@ -8,6 +8,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from uuid import uuid4
 
@@ -16,6 +17,11 @@ from logic_qa.database_governance import (
     DatabaseMigration,
     SQLiteDatabaseManager,
 )
+
+_PRACTICE_CORRECTION_REQUEST_COLUMNS = """
+    request_id, record_id, user_id, question_id, content_version, reason, status,
+    created_at, resolved_by, resolution_notes, resolved_at
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +60,65 @@ class DuplicatePracticeAttemptError(ValueError):
 
 class ImmutablePracticeAttemptError(ValueError):
     """已审核发布题目的练习记录不得由学习者删除。"""
+
+
+class PracticeCorrectionRequestStatus(StrEnum):
+    """不可变练习记录更正申请的当前处置状态。"""
+
+    PENDING = "pending"
+    RECORD_CONFIRMED = "record_confirmed"
+    REPUBLICATION_REQUIRED = "republication_required"
+
+
+class PracticeCorrectionResolution(StrEnum):
+    """管理员可写入的终态处置结论。"""
+
+    RECORD_CONFIRMED = "record_confirmed"
+    REPUBLICATION_REQUIRED = "republication_required"
+
+
+class DuplicatePracticeCorrectionRequestError(ValueError):
+    """同一练习记录已经提交过受控更正申请。"""
+
+
+class PracticeCorrectionRequestAlreadyResolvedError(ValueError):
+    """更正申请已处置，不能覆盖既有治理结论。"""
+
+
+@dataclass(frozen=True, slots=True)
+class PracticeCorrectionRequestInput:
+    """学习者对自身不可变练习记录提交的最小复核申请。"""
+
+    user_id: str
+    record_id: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class PracticeCorrectionResolutionInput:
+    """管理员对更正申请记录的终态处置。"""
+
+    request_id: str
+    resolver_id: str
+    resolution: PracticeCorrectionResolution
+    notes: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PracticeCorrectionRequest:
+    """不可变练习记录的受控更正申请及其当前治理状态。"""
+
+    request_id: str
+    record_id: str
+    user_id: str
+    question_id: str
+    content_version: str
+    reason: str
+    status: PracticeCorrectionRequestStatus
+    created_at: str
+    resolved_by: str | None
+    resolution_notes: str | None
+    resolved_at: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +161,11 @@ class LearningProfileStore:
                     2,
                     "add_versioned_practice_attempts",
                     self._migrate_v2,
+                ),
+                DatabaseMigration(
+                    3,
+                    "add_practice_correction_requests",
+                    self._migrate_v3,
                 ),
             ),
         )
@@ -188,6 +258,165 @@ class LearningProfileStore:
             )
         return cursor.rowcount == 1
 
+    def create_practice_correction_request(
+        self,
+        request: PracticeCorrectionRequestInput,
+    ) -> PracticeCorrectionRequest | None:
+        """为当前用户的不可变练习记录原子创建一次受控复核申请。"""
+        normalized_user_id = _validate_identifier(request.user_id, "用户标识")
+        normalized_record_id = _validate_identifier(request.record_id, "记录标识")
+        normalized_reason = _validate_reason(request.reason)
+        created_at = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            record = connection.execute(
+                """
+                SELECT record_id, question_id, content_version
+                FROM learning_records
+                WHERE record_id = ? AND user_id = ?
+                """,
+                (normalized_record_id, normalized_user_id),
+            ).fetchone()
+            if record is None:
+                return None
+            if record["content_version"] is None:
+                raise ValueError("仅已发布题目的练习记录可申请复核")
+            correction_request = PracticeCorrectionRequest(
+                request_id=str(uuid4()),
+                record_id=record["record_id"],
+                user_id=normalized_user_id,
+                question_id=record["question_id"],
+                content_version=record["content_version"],
+                reason=normalized_reason,
+                status=PracticeCorrectionRequestStatus.PENDING,
+                created_at=created_at,
+                resolved_by=None,
+                resolution_notes=None,
+                resolved_at=None,
+            )
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO practice_correction_requests (
+                    request_id, record_id, user_id, question_id, content_version,
+                    reason, status, created_at, resolved_by, resolution_notes,
+                    resolved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                _practice_correction_request_values(correction_request),
+            )
+            if cursor.rowcount != 1:
+                raise DuplicatePracticeCorrectionRequestError(
+                    "该练习记录已提交复核申请"
+                )
+            _insert_practice_correction_event(
+                connection,
+                request_id=correction_request.request_id,
+                actor_id=normalized_user_id,
+                event_type="requested",
+                status=correction_request.status,
+                notes=correction_request.reason,
+                created_at=created_at,
+            )
+        return correction_request
+
+    def list_practice_correction_requests_for_user(
+        self,
+        user_id: str,
+    ) -> tuple[PracticeCorrectionRequest, ...]:
+        """仅返回当前用户自身的更正申请，避免跨用户浏览。"""
+        normalized_user_id = _validate_identifier(user_id, "用户标识")
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {_PRACTICE_CORRECTION_REQUEST_COLUMNS}
+                FROM practice_correction_requests
+                WHERE user_id = ?
+                ORDER BY created_at DESC, request_id DESC
+                """,
+                (normalized_user_id,),
+            ).fetchall()
+        return tuple(_practice_correction_request_from_row(row) for row in rows)
+
+    def list_practice_correction_requests(
+        self,
+        status: PracticeCorrectionRequestStatus | None = None,
+    ) -> tuple[PracticeCorrectionRequest, ...]:
+        """供管理员按可选当前状态读取更正申请，不改写练习账本。"""
+        where_clause = ""
+        parameters: tuple[str, ...] = ()
+        if status is not None:
+            where_clause = "WHERE status = ?"
+            parameters = (status.value,)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {_PRACTICE_CORRECTION_REQUEST_COLUMNS}
+                FROM practice_correction_requests
+                {where_clause}
+                ORDER BY created_at ASC, request_id ASC
+                """,
+                parameters,
+            ).fetchall()
+        return tuple(_practice_correction_request_from_row(row) for row in rows)
+
+    def resolve_practice_correction_request(
+        self,
+        resolution: PracticeCorrectionResolutionInput,
+    ) -> PracticeCorrectionRequest | None:
+        """追加管理员处置事件，不修改原始练习记录或服务端判分。"""
+        request_id = _validate_identifier(resolution.request_id, "复核申请标识")
+        resolver_id = _validate_identifier(resolution.resolver_id, "处置人标识")
+        notes = _normalize_optional_text(resolution.notes, "处置备注", max_length=2_000)
+        status = PracticeCorrectionRequestStatus(resolution.resolution.value)
+        resolved_at = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE practice_correction_requests
+                SET status = ?, resolved_by = ?, resolution_notes = ?, resolved_at = ?
+                WHERE request_id = ? AND status = ?
+                """,
+                (
+                    status.value,
+                    resolver_id,
+                    notes,
+                    resolved_at,
+                    request_id,
+                    PracticeCorrectionRequestStatus.PENDING.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                existing = connection.execute(
+                    """
+                    SELECT request_id
+                    FROM practice_correction_requests
+                    WHERE request_id = ?
+                    """,
+                    (request_id,),
+                ).fetchone()
+                if existing is None:
+                    return None
+                raise PracticeCorrectionRequestAlreadyResolvedError(
+                    "复核申请已完成处置"
+                )
+            _insert_practice_correction_event(
+                connection,
+                request_id=request_id,
+                actor_id=resolver_id,
+                event_type="resolved",
+                status=status,
+                notes=notes,
+                created_at=resolved_at,
+            )
+            row = connection.execute(
+                f"""
+                SELECT {_PRACTICE_CORRECTION_REQUEST_COLUMNS}
+                FROM practice_correction_requests
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+        return _practice_correction_request_from_row(row)
+
     def attempted_question_ids(self, user_id: str) -> tuple[str, ...]:
         """兼容旧调用：返回当前用户全部学习记录涉及的题目标识。"""
         normalized_user_id = _validate_identifier(user_id, "用户标识")
@@ -255,6 +484,57 @@ class LearningProfileStore:
             CREATE UNIQUE INDEX idx_learning_records_practice_version
             ON learning_records (user_id, question_id, content_version)
             WHERE content_version IS NOT NULL
+            """
+        )
+
+    def _migrate_v3(self, connection: sqlite3.Connection) -> None:
+        """创建不可变练习账本的更正申请与追加式处置事件表。"""
+        connection.execute(
+            """
+            CREATE TABLE practice_correction_requests (
+                request_id TEXT PRIMARY KEY,
+                record_id TEXT NOT NULL UNIQUE,
+                user_id TEXT NOT NULL,
+                question_id TEXT NOT NULL,
+                content_version TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                resolved_by TEXT,
+                resolution_notes TEXT,
+                resolved_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX idx_practice_correction_requests_user_created
+            ON practice_correction_requests (user_id, created_at)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX idx_practice_correction_requests_status_created
+            ON practice_correction_requests (status, created_at)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE practice_correction_events (
+                event_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                notes TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX idx_practice_correction_events_request_created
+            ON practice_correction_events (request_id, created_at)
             """
         )
 
@@ -337,6 +617,70 @@ def _learning_record_values(record: LearningRecord) -> tuple[object, ...]:
     )
 
 
+def _practice_correction_request_values(
+    request: PracticeCorrectionRequest,
+) -> tuple[object, ...]:
+    return (
+        request.request_id,
+        request.record_id,
+        request.user_id,
+        request.question_id,
+        request.content_version,
+        request.reason,
+        request.status.value,
+        request.created_at,
+        request.resolved_by,
+        request.resolution_notes,
+        request.resolved_at,
+    )
+
+
+def _insert_practice_correction_event(
+    connection: sqlite3.Connection,
+    *,
+    request_id: str,
+    actor_id: str,
+    event_type: str,
+    status: PracticeCorrectionRequestStatus,
+    notes: str | None,
+    created_at: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO practice_correction_events (
+            event_id, request_id, actor_id, event_type, status, notes, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(uuid4()),
+            request_id,
+            actor_id,
+            event_type,
+            status.value,
+            notes,
+            created_at,
+        ),
+    )
+
+
+def _practice_correction_request_from_row(
+    row: sqlite3.Row,
+) -> PracticeCorrectionRequest:
+    return PracticeCorrectionRequest(
+        request_id=row["request_id"],
+        record_id=row["record_id"],
+        user_id=row["user_id"],
+        question_id=row["question_id"],
+        content_version=row["content_version"],
+        reason=row["reason"],
+        status=PracticeCorrectionRequestStatus(row["status"]),
+        created_at=row["created_at"],
+        resolved_by=row["resolved_by"],
+        resolution_notes=row["resolution_notes"],
+        resolved_at=row["resolved_at"],
+    )
+
+
 def _validate_record_input(record: LearningRecordInput) -> None:
     _validate_identifier(record.user_id, "用户标识")
     _validate_identifier(record.question_id, "题目标识")
@@ -355,6 +699,30 @@ def _validate_identifier(value: str, label: str) -> str:
         raise ValueError(f"{label}不能为空")
     if len(normalized) > 128:
         raise ValueError(f"{label}不能超过 128 个字符")
+    return normalized
+
+
+def _validate_reason(value: str) -> str:
+    return _validate_text(value, "复核理由", max_length=2_000)
+
+
+def _normalize_optional_text(
+    value: str | None,
+    label: str,
+    *,
+    max_length: int,
+) -> str | None:
+    if value is None:
+        return None
+    return _validate_text(value, label, max_length=max_length)
+
+
+def _validate_text(value: str, label: str, *, max_length: int) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{label}不能为空")
+    if len(normalized) > max_length:
+        raise ValueError(f"{label}不能超过 {max_length} 个字符")
     return normalized
 
 
