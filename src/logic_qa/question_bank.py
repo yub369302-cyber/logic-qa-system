@@ -236,6 +236,14 @@ class PublishedQuestion:
 
 
 @dataclass(frozen=True, slots=True)
+class PublishedQuestionVerificationSnapshot:
+    """同一题库读取快照中的历史发布事实及其活动状态。"""
+
+    question: PublishedQuestion | None
+    is_active: bool | None
+
+
+@dataclass(frozen=True, slots=True)
 class QuestionVersionLifecycleEvent:
     """下线或重新激活已发布版本时追加的不可变治理事件。"""
 
@@ -535,24 +543,10 @@ class QuestionBankStore:
         content_version: str,
     ) -> PublishedQuestion | None:
         """精确读取已发布版本，供跨存储投影核验历史发布事实。"""
-        normalized_question_id = _validate_text(question_id, "题目标识", max_length=128)
-        normalized_content_version = _validate_text(
+        return self.get_published_question_verification_snapshot(
+            question_id,
             content_version,
-            "内容版本",
-            max_length=128,
-        )
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT question_id, content_version, content_hash, question_type, stem,
-                       options, error_tags, knowledge_tags, formalization_version,
-                       formalization, published_at
-                FROM question_versions
-                WHERE question_id = ? AND content_version = ?
-                """,
-                (normalized_question_id, normalized_content_version),
-            ).fetchone()
-        return _question_from_row(row) if row else None
+        ).question
 
     def get_active_published_question(
         self,
@@ -560,6 +554,18 @@ class QuestionBankStore:
         content_version: str,
     ) -> PublishedQuestion | None:
         """精确读取当前活动发布版本，供受控治理链路核验新关联资格。"""
+        snapshot = self.get_published_question_verification_snapshot(
+            question_id,
+            content_version,
+        )
+        return snapshot.question if snapshot.is_active else None
+
+    def get_published_question_verification_snapshot(
+        self,
+        question_id: str,
+        content_version: str,
+    ) -> PublishedQuestionVerificationSnapshot:
+        """在同一题库读取快照中取得精确发布版本及其活动状态。"""
         normalized_question_id = _validate_text(question_id, "题目标识", max_length=128)
         normalized_content_version = _validate_text(
             content_version,
@@ -567,17 +573,26 @@ class QuestionBankStore:
             max_length=128,
         )
         with self._connect() as connection:
+            connection.execute("BEGIN")
             row = connection.execute(
                 """
                 SELECT question_id, content_version, content_hash, question_type, stem,
                        options, error_tags, knowledge_tags, formalization_version,
-                       formalization, published_at
+                       formalization, published_at, is_active
                 FROM question_versions
-                WHERE question_id = ? AND content_version = ? AND is_active = 1
+                WHERE question_id = ? AND content_version = ?
                 """,
                 (normalized_question_id, normalized_content_version),
             ).fetchone()
-        return _question_from_row(row) if row else None
+        if row is None:
+            return PublishedQuestionVerificationSnapshot(
+                question=None,
+                is_active=None,
+            )
+        return PublishedQuestionVerificationSnapshot(
+            question=_question_from_row(row),
+            is_active=bool(row["is_active"]),
+        )
 
     def deactivate_active_version(
         self,

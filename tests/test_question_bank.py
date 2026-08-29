@@ -966,6 +966,51 @@ def test_get_active_published_question_returns_current_audited_version(
         question_store.get_published_question("q-1", " ")
 
 
+def test_published_question_verification_snapshot_keeps_history_and_activity_together(
+    tmp_path: Path,
+) -> None:
+    """跨库核验快照必须在同一次题库读取中返回历史事实及活动状态。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    candidate, review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    published = question_store.publish(candidate, "publisher-a", review)
+
+    active_snapshot = question_store.get_published_question_verification_snapshot(
+        "q-1",
+        "content-v1",
+    )
+
+    assert active_snapshot.question == published
+    assert active_snapshot.is_active is True
+    assert question_store.deactivate_active_version(
+        "q-1",
+        "content-v1",
+        actor_id="admin-a",
+        reason="核验快照状态测试",
+    ) is not None
+    inactive_snapshot = question_store.get_published_question_verification_snapshot(
+        "q-1",
+        "content-v1",
+    )
+    missing_snapshot = question_store.get_published_question_verification_snapshot(
+        "missing",
+        "content-v1",
+    )
+
+    assert inactive_snapshot.question == published
+    assert inactive_snapshot.is_active is False
+    assert missing_snapshot.question is None
+    assert missing_snapshot.is_active is None
+    with pytest.raises(ValueError, match="题目标识不能为空"):
+        question_store.get_published_question_verification_snapshot(" ", "content-v1")
+    with pytest.raises(ValueError, match="内容版本不能为空"):
+        question_store.get_published_question_verification_snapshot("q-1", " ")
+
+
 def test_get_active_learner_question_hides_internal_fields_and_history(
     tmp_path: Path,
 ) -> None:
