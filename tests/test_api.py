@@ -31,18 +31,26 @@ def test_learner_static_assets_are_available() -> None:
     assert "/v1/admin/" not in script.text
 
 
-def test_practice_home_and_assets_expose_only_learner_paths() -> None:
-    """练习页与脚本应同源可用，且页面不包含管理端入口。"""
-    page = client.get("/practice")
-    script = client.get("/assets/practice.js")
+def test_practice_and_progress_pages_expose_only_learner_paths() -> None:
+    """练习与学习概览页面应同源可用，且不包含管理端入口。"""
+    practice_page = client.get("/practice")
+    practice_script = client.get("/assets/practice.js")
+    progress_page = client.get("/progress")
+    progress_script = client.get("/assets/progress.js")
 
-    assert page.status_code == 200
-    assert "练习已审核发布的逻辑题" in page.text
-    assert "/v1/admin/" not in page.text
-    assert script.status_code == 200
-    assert "/v1/learning/recommendations" in script.text
-    assert "/v1/learning/questions/" in script.text
-    assert "/v1/admin/" not in script.text
+    assert practice_page.status_code == 200
+    assert "练习已审核发布的逻辑题" in practice_page.text
+    assert "/v1/admin/" not in practice_page.text
+    assert practice_script.status_code == 200
+    assert "/v1/learning/recommendations" in practice_script.text
+    assert "/v1/learning/questions/" in practice_script.text
+    assert "/v1/admin/" not in practice_script.text
+    assert progress_page.status_code == 200
+    assert "把已完成的练习变成下一步行动" in progress_page.text
+    assert "/v1/admin/" not in progress_page.text
+    assert progress_script.status_code == 200
+    assert 'fetch("/v1/learning/profile")' in progress_script.text
+    assert "/v1/admin/" not in progress_script.text
 
 
 def test_health_check() -> None:

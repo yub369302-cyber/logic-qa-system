@@ -681,8 +681,11 @@ def test_practice_attempt_is_scored_server_side_and_records_current_user(
     assert profile.status_code == 200
     assert profile.json()["total_attempts"] == 1
     assert profile.json()["correct_attempts"] == 0
-    assert profile.json()["error_counts"] == [["invalid_converse", 1]]
-    assert profile.json()["knowledge_mastery"] == [["逆命题与逆否命题", 0.0]]
+    assert profile.json()["focus_areas"][0]["title"] == "条件方向核验"
+    assert "error_counts" not in profile.json()
+    assert "knowledge_mastery" not in profile.json()
+    assert "invalid_converse" not in str(profile.json())
+    assert "逆命题与逆否命题" not in str(profile.json())
 
 
 def test_practice_attempt_records_are_isolated_per_authenticated_user(

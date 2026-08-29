@@ -702,6 +702,80 @@
     background: var(--danger-soft);
   }
 
+  .progress-page {
+    display: grid;
+    gap: 1rem;
+    padding-block: clamp(2.5rem, 5vw, 5rem);
+  }
+
+  .progress-page .practice-hero {
+    margin-bottom: 0;
+  }
+
+  .progress-panel,
+  .focus-panel {
+    container-type: inline-size;
+  }
+
+  .progress-metrics {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.75rem;
+    margin-top: 1.25rem;
+  }
+
+  .progress-metrics > div {
+    min-width: 0;
+    padding: 1rem;
+    background: var(--surface-soft);
+    border: 1px solid var(--line);
+    border-radius: 0.75rem;
+  }
+
+  .progress-metrics dt {
+    color: var(--ink-muted);
+    font-size: 0.8rem;
+    font-weight: 650;
+  }
+
+  .progress-metrics dd {
+    margin-top: 0.25rem;
+    font-size: clamp(1.45rem, 3.5vw, 2.2rem);
+    font-weight: 780;
+    letter-spacing: -0.04em;
+  }
+
+  .focus-list {
+    display: grid;
+    gap: 0.75rem;
+    margin-top: 1rem;
+  }
+
+  .focus-item {
+    padding: 1rem;
+    border: 1px solid var(--line);
+    border-radius: 0.75rem;
+    background: var(--surface-soft);
+  }
+
+  .focus-item h3 {
+    margin-top: 0.2rem;
+    font-size: 1rem;
+  }
+
+  .focus-item > p:not(.section-kicker) {
+    margin-top: 0.4rem;
+    color: var(--ink-muted);
+    font-size: 0.925rem;
+  }
+
+  .focus-item .focus-suggestion {
+    padding-top: 0.75rem;
+    color: var(--ink);
+    font-weight: 650;
+    border-top: 1px solid var(--line);
+  }
+
   .site-footer {
     padding-block: 2rem;
     color: var(--ink-muted);
@@ -717,6 +791,10 @@
 
     .header-nav {
       justify-content: flex-end;
+    }
+
+    .progress-metrics {
+      grid-template-columns: 1fr;
     }
   }
 

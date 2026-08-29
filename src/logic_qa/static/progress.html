@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="查看当前认证学习者的练习概览和受控复盘方向。"
+    />
+    <title>学习概览 · 可信逻辑答疑</title>
+    <link rel="stylesheet" href="/assets/app.css" />
+    <script src="/assets/progress.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#progress">跳至学习概览</a>
+    <header class="site-header">
+      <div class="page-shell header-content">
+        <a class="brand" href="/" aria-label="可信逻辑答疑首页">可信逻辑答疑</a>
+        <nav class="header-nav" aria-label="主导航">
+          <a href="/">自主验证</a>
+          <a href="/practice">题库练习</a>
+          <a href="/progress" aria-current="page">学习概览</a>
+          <a href="/docs">接口文档</a>
+        </nav>
+      </div>
+    </header>
+
+    <main class="page-shell progress-page" id="progress">
+      <section class="practice-hero" aria-labelledby="progress-title">
+        <p class="eyebrow">LEARNING OVERVIEW</p>
+        <h1 id="progress-title">把已完成的练习变成下一步行动</h1>
+        <p>
+          概览只展示当前认证用户的汇总表现和经过服务端提炼的复盘方向。它不返回题目答案、内部标签、审核信息或形式化资产。
+        </p>
+      </section>
+
+      <section class="auth-notice" aria-labelledby="progress-auth-title">
+        <p class="section-kicker">认证边界</p>
+        <h2 id="progress-auth-title">本页只读取当前认证学习者的数据</h2>
+        <p>
+          若部署侧没有注入受信代理身份，概览不会显示其他用户的数据，也不会降级为匿名统计。
+        </p>
+      </section>
+
+      <section class="progress-panel panel" aria-labelledby="summary-title">
+        <div class="panel-heading">
+          <div>
+            <p class="section-kicker">练习概览</p>
+            <h2 id="summary-title">当前进度</h2>
+          </div>
+          <button class="text-button" id="refresh-progress" type="button">刷新</button>
+        </div>
+        <p class="field-help" id="progress-status" aria-live="polite">正在读取你的学习概览。</p>
+        <dl class="progress-metrics" id="progress-metrics" aria-live="polite">
+          <div>
+            <dt>已完成练习</dt>
+            <dd id="total-attempts">—</dd>
+          </div>
+          <div>
+            <dt>正确次数</dt>
+            <dd id="correct-attempts">—</dd>
+          </div>
+          <div>
+            <dt>当前正确率</dt>
+            <dd id="accuracy">—</dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="focus-panel panel" aria-labelledby="focus-title">
+        <div class="panel-heading">
+          <div>
+            <p class="section-kicker">受控复盘</p>
+            <h2 id="focus-title">下一步建议</h2>
+          </div>
+        </div>
+        <div class="focus-list" id="focus-list" aria-live="polite"></div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="page-shell">
+        <p>可信逻辑答疑 MVP · 统计与复盘只归属当前认证学习者，并保持题目与审核资产隔离。</p>
+      </div>
+    </footer>
+  </body>
+</html>
