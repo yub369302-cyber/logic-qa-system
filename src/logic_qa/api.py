@@ -1512,7 +1512,7 @@ def _verify_republication_for_audit(
             observed_content_hash=None,
         )
     try:
-        published = question_bank_store.get_published_question(
+        snapshot = question_bank_store.get_published_question_verification_snapshot(
             republication.question_id,
             republication.new_content_version,
         )
@@ -1521,6 +1521,7 @@ def _verify_republication_for_audit(
             status=RepublicationVerificationStatus.UNVERIFIABLE,
             observed_content_hash=None,
         )
+    published = snapshot.question
     if published is None:
         return AdminPracticeCorrectionRepublicationVerificationResponse(
             status=RepublicationVerificationStatus.MISSING,
@@ -1531,24 +1532,14 @@ def _verify_republication_for_audit(
             status=RepublicationVerificationStatus.CONTENT_HASH_MISMATCH,
             observed_content_hash=published.content_hash,
         )
-    try:
-        active = question_bank_store.get_active_published_question(
-            republication.question_id,
-            republication.new_content_version,
-        )
-    except (OSError, sqlite3.Error, ValueError):
-        return AdminPracticeCorrectionRepublicationVerificationResponse(
-            status=RepublicationVerificationStatus.UNVERIFIABLE,
-            observed_content_hash=published.content_hash,
-        )
-    if active is None:
+    if not snapshot.is_active:
         return AdminPracticeCorrectionRepublicationVerificationResponse(
             status=RepublicationVerificationStatus.HISTORICAL_INACTIVE,
             observed_content_hash=published.content_hash,
         )
     return AdminPracticeCorrectionRepublicationVerificationResponse(
         status=RepublicationVerificationStatus.ACTIVE_VERIFIED,
-        observed_content_hash=active.content_hash,
+        observed_content_hash=published.content_hash,
     )
 
 

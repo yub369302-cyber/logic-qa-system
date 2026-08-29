@@ -1145,22 +1145,18 @@ def test_republication_audit_verification_detects_abnormal_cross_store_facts(
     assert binding_result.observed_content_hash is None
 
     class HashMismatchStore:
-        """返回同版本但不同摘要的历史发布事实。"""
+        """返回同一读取快照中的不同历史摘要。"""
 
-        def get_published_question(
+        def get_published_question_verification_snapshot(
             self,
             question_id: str,
             content_version: str,
         ) -> SimpleNamespace:
             assert (question_id, content_version) == ("q-1", "content-v2")
-            return SimpleNamespace(content_hash="b" * 64)
-
-        def get_active_published_question(
-            self,
-            question_id: str,
-            content_version: str,
-        ) -> None:
-            raise AssertionError("摘要不匹配时不应继续读取活动状态")
+            return SimpleNamespace(
+                question=SimpleNamespace(content_hash="b" * 64),
+                is_active=True,
+            )
 
     monkeypatch.setattr(api, "question_bank_store", HashMismatchStore())
     hash_result = api._verify_republication_for_audit(
@@ -1177,7 +1173,7 @@ def test_republication_audit_verification_detects_abnormal_cross_store_facts(
     class UnavailableStore:
         """模拟题库独立存储暂时不可读取。"""
 
-        def get_published_question(
+        def get_published_question_verification_snapshot(
             self,
             question_id: str,
             content_version: str,
