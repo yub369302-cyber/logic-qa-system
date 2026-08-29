@@ -1160,15 +1160,21 @@ def reconcile_admin_practice_correction_republications(
 ) -> AdminPracticeCorrectionReconciliationResponse:
     """分页巡检所有不可变关联，只读报告跨库当前核验异常。"""
     try:
-        total_linked_audits = learning_store.count_linked_practice_correction_audits()
-        audits = learning_store.list_practice_correction_audits(
-            linked=True,
+        audit_page = learning_store.list_linked_practice_correction_audit_page(
             limit=limit,
             offset=offset,
         )
+    except (OSError, sqlite3.Error) as error:
+        raise HTTPException(
+            status_code=503,
+            detail="学习库暂时不可用，无法完成巡检",
+        ) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    audit_responses = [_practice_correction_audit_to_response(item) for item in audits]
+    audit_responses = [
+        _practice_correction_audit_to_response(item) for item in audit_page.audits
+    ]
+    total_linked_audits = audit_page.total_linked_audits
     active_verified_audits = sum(
         response.republication_verification is not None
         and response.republication_verification.status

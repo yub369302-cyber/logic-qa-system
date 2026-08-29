@@ -196,6 +196,14 @@ class PracticeCorrectionAudit:
 
 
 @dataclass(frozen=True, slots=True)
+class LinkedPracticeCorrectionAuditPage:
+    """同一学习库读取快照内的已关联申请总数和稳定分页审计视图。"""
+
+    total_linked_audits: int
+    audits: tuple[PracticeCorrectionAudit, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class LearningRecommendation:
     """基于用户自身统计生成的练习方向，而不是虚构题目。"""
 
@@ -628,10 +636,7 @@ class LearningProfileStore:
             if new_content_version is not None
             else None
         )
-        if not 1 <= limit <= 100:
-            raise ValueError("审计查询数量必须介于 1 到 100")
-        if not 0 <= offset <= 10_000:
-            raise ValueError("审计查询偏移量必须介于 0 到 10000")
+        _validate_audit_page_arguments(limit=limit, offset=offset)
 
         filters: list[str] = []
         parameters: list[object] = []
@@ -694,21 +699,58 @@ class LearningProfileStore:
             for request in requests
         )
 
-    def count_linked_practice_correction_audits(self) -> int:
-        """返回当前学习库中不可变重发布关联的精确数量。"""
+    def list_linked_practice_correction_audit_page(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> LinkedPracticeCorrectionAuditPage:
+        """在同一学习库读取快照中统计并分页读取不可变重发布关联。"""
+        _validate_audit_page_arguments(limit=limit, offset=offset)
         with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT COUNT(*) AS audit_count
+            connection.execute("BEGIN")
+            total_linked_audits = _count_linked_practice_correction_audits(connection)
+            rows = connection.execute(
+                f"""
+                SELECT {_PRACTICE_CORRECTION_REQUEST_COLUMNS}
                 FROM practice_correction_requests AS request
                 WHERE EXISTS (
                     SELECT 1
                     FROM practice_correction_republications AS republication
                     WHERE republication.request_id = request.request_id
                 )
-                """
-            ).fetchone()
-        return int(row["audit_count"])
+                ORDER BY request.created_at ASC, request.request_id ASC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            ).fetchall()
+            requests = tuple(
+                _practice_correction_request_from_row(row) for row in rows
+            )
+            republications = _republications_by_request_id_for_connection(
+                connection,
+                (request.request_id for request in requests),
+            )
+            events = _events_by_request_id_for_connection(
+                connection,
+                (request.request_id for request in requests),
+            )
+        return LinkedPracticeCorrectionAuditPage(
+            total_linked_audits=total_linked_audits,
+            audits=tuple(
+                PracticeCorrectionAudit(
+                    request=request,
+                    republication=republications.get(request.request_id),
+                    events=events.get(request.request_id, ()),
+                )
+                for request in requests
+            ),
+        )
+
+    def count_linked_practice_correction_audits(self) -> int:
+        """返回当前学习库中不可变重发布关联的精确数量。"""
+        with self._connect() as connection:
+            return _count_linked_practice_correction_audits(connection)
 
     def resolve_practice_correction_request(
         self,
@@ -919,51 +961,15 @@ class LearningProfileStore:
         self,
         request_ids: Iterable[str],
     ) -> dict[str, PracticeCorrectionRepublication]:
-        normalized_request_ids = tuple(request_ids)
-        if not normalized_request_ids:
-            return {}
-        placeholders = ", ".join("?" for _ in normalized_request_ids)
         with self._connect() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT {_PRACTICE_CORRECTION_REPUBLICATION_COLUMNS}
-                FROM practice_correction_republications
-                WHERE request_id IN ({placeholders})
-                """,
-                normalized_request_ids,
-            ).fetchall()
-        return {
-            row["request_id"]: _practice_correction_republication_from_row(row)
-            for row in rows
-        }
+            return _republications_by_request_id_for_connection(connection, request_ids)
 
     def _events_by_request_id(
         self,
         request_ids: Iterable[str],
     ) -> dict[str, tuple[PracticeCorrectionEvent, ...]]:
-        normalized_request_ids = tuple(request_ids)
-        if not normalized_request_ids:
-            return {}
-        placeholders = ", ".join("?" for _ in normalized_request_ids)
         with self._connect() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT event_id, request_id, actor_id, event_type, status, notes,
-                       created_at
-                FROM practice_correction_events
-                WHERE request_id IN ({placeholders})
-                ORDER BY request_id ASC, created_at ASC, rowid ASC
-                """,
-                normalized_request_ids,
-            ).fetchall()
-        events_by_request_id: dict[str, list[PracticeCorrectionEvent]] = {}
-        for row in rows:
-            event = _practice_correction_event_from_row(row)
-            events_by_request_id.setdefault(event.request_id, []).append(event)
-        return {
-            request_id: tuple(events)
-            for request_id, events in events_by_request_id.items()
-        }
+            return _events_by_request_id_for_connection(connection, request_ids)
 
     def _records_for_user(self, user_id: str) -> tuple[LearningRecord, ...]:
         with self._connect() as connection:
@@ -990,6 +996,80 @@ class LearningProfileStore:
                 yield connection
         finally:
             connection.close()
+
+
+def _validate_audit_page_arguments(*, limit: int, offset: int) -> None:
+    if not 1 <= limit <= 100:
+        raise ValueError("审计查询数量必须介于 1 到 100")
+    if not 0 <= offset <= 10_000:
+        raise ValueError("审计查询偏移量必须介于 0 到 10000")
+
+
+def _count_linked_practice_correction_audits(
+    connection: sqlite3.Connection,
+) -> int:
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS audit_count
+        FROM practice_correction_requests AS request
+        WHERE EXISTS (
+            SELECT 1
+            FROM practice_correction_republications AS republication
+            WHERE republication.request_id = request.request_id
+        )
+        """
+    ).fetchone()
+    return int(row["audit_count"])
+
+
+def _republications_by_request_id_for_connection(
+    connection: sqlite3.Connection,
+    request_ids: Iterable[str],
+) -> dict[str, PracticeCorrectionRepublication]:
+    normalized_request_ids = tuple(request_ids)
+    if not normalized_request_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in normalized_request_ids)
+    rows = connection.execute(
+        f"""
+        SELECT {_PRACTICE_CORRECTION_REPUBLICATION_COLUMNS}
+        FROM practice_correction_republications
+        WHERE request_id IN ({placeholders})
+        """,
+        normalized_request_ids,
+    ).fetchall()
+    return {
+        row["request_id"]: _practice_correction_republication_from_row(row)
+        for row in rows
+    }
+
+
+def _events_by_request_id_for_connection(
+    connection: sqlite3.Connection,
+    request_ids: Iterable[str],
+) -> dict[str, tuple[PracticeCorrectionEvent, ...]]:
+    normalized_request_ids = tuple(request_ids)
+    if not normalized_request_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in normalized_request_ids)
+    rows = connection.execute(
+        f"""
+        SELECT event_id, request_id, actor_id, event_type, status, notes,
+               created_at
+        FROM practice_correction_events
+        WHERE request_id IN ({placeholders})
+        ORDER BY request_id ASC, created_at ASC, rowid ASC
+        """,
+        normalized_request_ids,
+    ).fetchall()
+    events_by_request_id: dict[str, list[PracticeCorrectionEvent]] = {}
+    for row in rows:
+        event = _practice_correction_event_from_row(row)
+        events_by_request_id.setdefault(event.request_id, []).append(event)
+    return {
+        request_id: tuple(events)
+        for request_id, events in events_by_request_id.items()
+    }
 
 
 def _new_learning_record(record: LearningRecordInput) -> LearningRecord:

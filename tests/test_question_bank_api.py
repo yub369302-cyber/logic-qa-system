@@ -1098,6 +1098,35 @@ def test_admin_republication_reconciliation_paginates_linked_audits(
     }
 
 
+def test_reconciliation_fails_closed_when_learning_store_is_unavailable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """学习库巡检读取失败时不得返回可能不一致的计数或异常清单。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+
+    class UnavailableLearningStore:
+        """模拟学习库读取期间发生 SQLite 运行时错误。"""
+
+        def list_linked_practice_correction_audit_page(
+            self,
+            *,
+            limit: int,
+            offset: int,
+        ) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(api, "learning_store", UnavailableLearningStore())
+
+    response = client.get(
+        "/v1/admin/practice-correction-reconciliations",
+        headers=_ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "学习库暂时不可用，无法完成巡检"
+
+
 def test_republication_audit_verification_detects_abnormal_cross_store_facts(
     monkeypatch,
 ) -> None:
