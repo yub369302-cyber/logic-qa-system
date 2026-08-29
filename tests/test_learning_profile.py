@@ -8,6 +8,7 @@ import pytest
 
 from logic_qa.learning_profile import (
     DuplicatePracticeAttemptError,
+    ImmutablePracticeAttemptError,
     LearningProfileStore,
     LearningRecordInput,
 )
@@ -75,6 +76,28 @@ def test_deleting_record_requires_matching_user_and_updates_profile(
     assert store.delete_record("user-a", record.record_id) is True
     assert store.get_profile("user-a").total_attempts == 0
     assert store.get_profile("user-a").recommendations == ()
+
+
+def test_deleting_versioned_practice_record_is_rejected(tmp_path: Path) -> None:
+    """发布题练习记录不可删除，避免重新打开已完成版本的推荐入口。"""
+    store = _store(tmp_path)
+    record = store.record_practice_attempt(
+        LearningRecordInput(
+            user_id="user-a",
+            question_id="q-1",
+            content_version="content-v1",
+            question_type="propositional",
+            is_correct=True,
+        )
+    )
+
+    with pytest.raises(ImmutablePracticeAttemptError, match="练习记录不可删除"):
+        store.delete_record("user-a", record.record_id)
+
+    assert store.get_profile("user-a").total_attempts == 1
+    assert store.attempted_practice_versions("user-a") == (
+        ("q-1", "content-v1"),
+    )
 
 
 def test_profile_recommends_lowest_mastery_knowledge_tag(tmp_path: Path) -> None:

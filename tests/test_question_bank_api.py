@@ -722,6 +722,43 @@ def test_practice_attempt_records_are_isolated_per_authenticated_user(
     assert second_user.json()["is_correct"] is True
 
 
+def test_practice_attempt_record_cannot_be_deleted_by_its_owner(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """练习账本记录不可删除，避免用户通过删除重新获取同一版本。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    payload = _publish_payload("q-1", "content-v1")
+    _prepare_and_approve(client, payload)
+    published = client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=payload,
+    )
+    assert published.status_code == 200
+
+    attempt = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "B"},
+    )
+    delete_response = client.delete(
+        f"/v1/learning/records/{attempt.json()['record_id']}",
+        headers=_LEARNER_HEADERS,
+    )
+    duplicate = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "B"},
+    )
+
+    assert attempt.status_code == 200
+    assert delete_response.status_code == 409
+    assert delete_response.json()["detail"] == "练习记录不可删除"
+    assert duplicate.status_code == 409
+    assert duplicate.json()["detail"] == "该题目版本已完成练习，请选择下一题"
+
+
 def test_active_practice_question_rejects_invalid_identifiers(
     tmp_path: Path,
     monkeypatch,

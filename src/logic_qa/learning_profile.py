@@ -52,6 +52,10 @@ class DuplicatePracticeAttemptError(ValueError):
     """当前用户已完成同一不可变题目版本的练习。"""
 
 
+class ImmutablePracticeAttemptError(ValueError):
+    """已审核发布题目的练习记录不得由学习者删除。"""
+
+
 @dataclass(frozen=True, slots=True)
 class LearningRecommendation:
     """基于用户自身统计生成的练习方向，而不是虚构题目。"""
@@ -162,10 +166,22 @@ class LearningProfileStore:
         )
 
     def delete_record(self, user_id: str, record_id: str) -> bool:
-        """仅当记录属于该用户时删除，避免跨用户误删。"""
+        """只删除当前用户的通用记录，保留已审核发布题目的练习账本。"""
         normalized_user_id = _validate_identifier(user_id, "用户标识")
         normalized_record_id = _validate_identifier(record_id, "记录标识")
         with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT content_version
+                FROM learning_records
+                WHERE record_id = ? AND user_id = ?
+                """,
+                (normalized_record_id, normalized_user_id),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["content_version"] is not None:
+                raise ImmutablePracticeAttemptError("练习记录不可删除")
             cursor = connection.execute(
                 "DELETE FROM learning_records WHERE record_id = ? AND user_id = ?",
                 (normalized_record_id, normalized_user_id),
