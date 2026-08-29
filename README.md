@@ -197,6 +197,12 @@ API 适配层按职责拆分：`api.py` 负责应用装配、通用求解、学�
 
 核验状态为 `active_verified` 时，关联版本仍存在、摘要精确匹配且当前活动；`historical_inactive` 表示版本和摘要仍存在但已被下线或替换；`missing` 表示题库当前不存在该版本；`content_hash_mismatch` 表示同版本的当前题库摘要与不可变关联摘要不一致；`request_binding_mismatch` 表示关联与申请的题号或原版本不一致；`unverifiable` 表示独立题库暂时无法可靠读取。除 `missing`、关联绑定异常和首次读取失败外，响应会回显题库实际观察到的摘要，供管理员审计比对。未关联申请的该字段为 `null`。学习者不能访问管理员审计接口，且既有学习者结果仍只在关联版本精确匹配且活动时显示“已发布”；若学习者读取期间题库暂时不可用或校验输入非法，结果会安全降级为“将按发布流程复核”，而非暴露底层错误或继续声称新版本可练习。
 
+### 阶段 7.12：跨库重发布关联一致性巡检
+
+管理员可通过 `GET /v1/admin/practice-correction-reconciliations` 分页巡检所有已存在不可变重发布关联。接口只接受管理角色的受信身份，并以稳定的创建时间与申请编号顺序读取学习库：`limit` 默认为 50、范围为 1 至 100，`offset` 默认为 0、范围为 0 至 10000。响应包含当前全部关联总数、请求偏移量、当前页扫描数、当前页 `active_verified` 数量和可继续读取的 `next_offset`；仅当还有未扫描的关联时才会返回下一个偏移量。
+
+每页的 `non_verified_audits` 只收录当前核验并非 `active_verified` 的完整管理员审计视图，因此可直接定位下线、缺失、摘要错配、绑定错配或题库不可读等情形。巡检复用既有只读核验，不写入或修复学习库、题库、审核库、版本生命周期事件和学习账本；它报告当前事实，不改写不可变历史关联，也不把异常自动解释为可发布状态。
+
 ## 快速启动
 
 ```powershell
@@ -239,6 +245,6 @@ uv run python -m compileall -q src tests
 
 ## 主要接口与部署配置
 
-主要接口包括：`POST /v1/questions/solve` 用于结构化命题推理，`POST /v1/questions/solve-chinese` 用于中文条件解析、确认请求和确认后求解，`POST /v1/questions/verify-choice` 用于选择题选项验证，`POST /v1/questions/solve-ordering`、`solve-grouping` 和 `solve-matching` 用于组合约束题，`POST /v1/questions/ocr` 与 `/ocr/correct` 用于图片文字校正，`POST /v1/questions/review-solution` 用于结构化步骤批改，以及 `/v1/learning/*` 用于用户最小学习档案。`POST /v1/learning/practice-correction-requests` 允许学习者为自己的不可变发布题练习记录提交一次复核，`GET` 同一路径仅返回其最小申请状态；`GET /v1/learning/practice-correction-outcomes` 返回不含内部信息的派生处置说明。管理员可通过 `GET /v1/admin/practice-correction-requests` 查看申请，并以 `POST /v1/admin/practice-correction-requests/{request_id}/resolution` 追加终态处置；只有新版本已发布且活动时，才可通过 `POST /v1/admin/questions/{question_id}/{content_version}/correction-republication-links` 将 `republication_required` 申请显式关联到该版本。`GET /v1/admin/practice-correction-audits` 及其单申请路径提供仅管理员可见的关联、当前跨库核验状态和事件链审计查询。管理端的 `POST /v1/admin/question-candidates` 需提交完整形式化资产，`GET /v1/admin/question-candidates/{question_id}/{content_version}/{content_hash}` 可精确回查候选快照，`POST /v1/admin/questions` 会在发布前复算并记录形式化验证依据。已发布活动版本可使用 `POST /v1/admin/questions/{question_id}/{content_version}/deactivation` 受控下线；历史已发布版本可使用对应的 `/reactivation` 在当前精确审核及确定性复验仍通过后重新激活；`GET /v1/admin/questions/{question_id}/version-lifecycle-events` 仅供管理员回查不可变的版本治理事件。
+主要接口包括：`POST /v1/questions/solve` 用于结构化命题推理，`POST /v1/questions/solve-chinese` 用于中文条件解析、确认请求和确认后求解，`POST /v1/questions/verify-choice` 用于选择题选项验证，`POST /v1/questions/solve-ordering`、`solve-grouping` 和 `solve-matching` 用于组合约束题，`POST /v1/questions/ocr` 与 `/ocr/correct` 用于图片文字校正，`POST /v1/questions/review-solution` 用于结构化步骤批改，以及 `/v1/learning/*` 用于用户最小学习档案。`POST /v1/learning/practice-correction-requests` 允许学习者为自己的不可变发布题练习记录提交一次复核，`GET` 同一路径仅返回其最小申请状态；`GET /v1/learning/practice-correction-outcomes` 返回不含内部信息的派生处置说明。管理员可通过 `GET /v1/admin/practice-correction-requests` 查看申请，并以 `POST /v1/admin/practice-correction-requests/{request_id}/resolution` 追加终态处置；只有新版本已发布且活动时，才可通过 `POST /v1/admin/questions/{question_id}/{content_version}/correction-republication-links` 将 `republication_required` 申请显式关联到该版本。`GET /v1/admin/practice-correction-audits` 及其单申请路径提供仅管理员可见的关联、当前跨库核验状态和事件链审计查询；`GET /v1/admin/practice-correction-reconciliations` 以 `limit` 和 `offset` 分页巡检全部已关联申请，并仅返回当前非 `active_verified` 的完整审计项。管理端的 `POST /v1/admin/question-candidates` 需提交完整形式化资产，`GET /v1/admin/question-candidates/{question_id}/{content_version}/{content_hash}` 可精确回查候选快照，`POST /v1/admin/questions` 会在发布前复算并记录形式化验证依据。已发布活动版本可使用 `POST /v1/admin/questions/{question_id}/{content_version}/deactivation` 受控下线；历史已发布版本可使用对应的 `/reactivation` 在当前精确审核及确定性复验仍通过后重新激活；`GET /v1/admin/questions/{question_id}/version-lifecycle-events` 仅供管理员回查不可变的版本治理事件。
 
 部署可通过 `LOGIC_QA_DATABASE_PATH`、`LOGIC_QA_REVIEW_DATABASE_PATH` 和 `LOGIC_QA_QUESTION_DATABASE_PATH` 指定 SQLite 文件路径。认证接口必须配置 `LOGIC_QA_TRUSTED_PROXY_TOKEN`；前置可信代理完成上游登录后，向服务注入 `X-Logic-QA-Proxy-Token`、`X-Logic-QA-Subject` 与 `X-Logic-QA-Roles`。学习者接口不再接收路径、查询参数或请求体中的用户标识，审核人与发布人也由认证主体自动写入。未配置代理密钥时身份相关接口默认关闭。OCR 默认依赖本地 Tesseract，未安装时会返回 503 和明确说明，不会伪造识别结果。

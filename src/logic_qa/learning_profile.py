@@ -605,6 +605,7 @@ class LearningProfileStore:
         new_content_version: str | None = None,
         linked: bool | None = None,
         limit: int = 50,
+        offset: int = 0,
     ) -> tuple[PracticeCorrectionAudit, ...]:
         """按精确申请、题目或版本筛选管理员审计视图，单次读取数量受限。"""
         normalized_request_id = (
@@ -629,6 +630,8 @@ class LearningProfileStore:
         )
         if not 1 <= limit <= 100:
             raise ValueError("审计查询数量必须介于 1 到 100")
+        if not 0 <= offset <= 10_000:
+            raise ValueError("审计查询偏移量必须介于 0 到 10000")
 
         filters: list[str] = []
         parameters: list[object] = []
@@ -665,7 +668,7 @@ class LearningProfileStore:
                 """
             )
         where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
-        parameters.append(limit)
+        parameters.extend((limit, offset))
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
@@ -673,7 +676,7 @@ class LearningProfileStore:
                 FROM practice_correction_requests AS request
                 {where_clause}
                 ORDER BY request.created_at ASC, request.request_id ASC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
                 tuple(parameters),
             ).fetchall()
@@ -690,6 +693,22 @@ class LearningProfileStore:
             )
             for request in requests
         )
+
+    def count_linked_practice_correction_audits(self) -> int:
+        """返回当前学习库中不可变重发布关联的精确数量。"""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS audit_count
+                FROM practice_correction_requests AS request
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM practice_correction_republications AS republication
+                    WHERE republication.request_id = request.request_id
+                )
+                """
+            ).fetchone()
+        return int(row["audit_count"])
 
     def resolve_practice_correction_request(
         self,

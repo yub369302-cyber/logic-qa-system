@@ -1037,6 +1037,12 @@ def test_practice_correction_audit_query_returns_immutable_link_and_event_chain(
     exact = store.get_practice_correction_audit(request_ids[0])
     linked_only = store.list_practice_correction_audits(linked=True)
     unlinked_only = store.list_practice_correction_audits(linked=False)
+    linked_page = store.list_practice_correction_audits(linked=True, limit=1)
+    empty_linked_page = store.list_practice_correction_audits(
+        linked=True,
+        limit=1,
+        offset=1,
+    )
     by_new_version = store.list_practice_correction_audits(
         new_content_version="content-v2"
     )
@@ -1064,6 +1070,9 @@ def test_practice_correction_audit_query_returns_immutable_link_and_event_chain(
         "republication_required",
     ]
     assert linked_only == (exact,)
+    assert linked_page == (exact,)
+    assert empty_linked_page == ()
+    assert store.count_linked_practice_correction_audits() == 1
     assert len(unlinked_only) == 1
     assert unlinked_only[0].request.request_id == request_ids[1]
     assert unlinked_only[0].republication is None
@@ -1091,6 +1100,10 @@ def test_practice_correction_audit_query_validates_filters_and_limit(
         store.list_practice_correction_audits(limit=0)
     with pytest.raises(ValueError, match="数量必须介于 1 到 100"):
         store.list_practice_correction_audits(limit=101)
+    with pytest.raises(ValueError, match="偏移量必须介于 0 到 10000"):
+        store.list_practice_correction_audits(offset=-1)
+    with pytest.raises(ValueError, match="偏移量必须介于 0 到 10000"):
+        store.list_practice_correction_audits(offset=10_001)
     with pytest.raises(ValueError, match="复核申请标识不能为空"):
         store.get_practice_correction_audit(" ")
     assert store.get_practice_correction_audit("missing-request") is None
