@@ -39,6 +39,7 @@ from logic_qa.grouping_matching_solver import (
     MatchingSolveStatus,
 )
 from logic_qa.learning_profile import (
+    DuplicatePracticeAttemptError,
     LearningProfile,
     LearningProfileStore,
     LearningRecord,
@@ -794,10 +795,10 @@ def get_practice_recommendations(
     """基于当前认证用户的记录推荐未尝试且已审核发布的题目。"""
     try:
         profile = learning_store.get_profile(identity.subject)
-        attempted = learning_store.attempted_question_ids(identity.subject)
+        attempted = learning_store.attempted_practice_versions(identity.subject)
         recommendations = question_bank_store.recommend(
             profile=profile,
-            attempted_question_ids=attempted,
+            attempted_question_versions=attempted,
             limit=limit,
         )
     except ValueError as error:
@@ -848,21 +849,24 @@ def submit_practice_answer(
         raise HTTPException(status_code=422, detail=str(error)) from error
     if attempt is None:
         raise HTTPException(status_code=404, detail="未找到可供练习的已发布题目")
-    if attempt.question.question_id in learning_store.attempted_question_ids(
-        identity.subject
-    ):
-        raise HTTPException(status_code=409, detail="该题已完成练习，请选择下一题")
-    record = learning_store.add_record(
-        LearningRecordInput(
-            user_id=identity.subject,
-            question_id=attempt.question.question_id,
-            question_type=attempt.question.question_type,
-            is_correct=attempt.is_correct,
-            error_tags=attempt.error_tags if not attempt.is_correct else (),
-            knowledge_tags=attempt.knowledge_tags,
-            duration_seconds=request.duration_seconds,
+    try:
+        record = learning_store.record_practice_attempt(
+            LearningRecordInput(
+                user_id=identity.subject,
+                question_id=attempt.question.question_id,
+                content_version=attempt.question.content_version,
+                question_type=attempt.question.question_type,
+                is_correct=attempt.is_correct,
+                error_tags=attempt.error_tags if not attempt.is_correct else (),
+                knowledge_tags=attempt.knowledge_tags,
+                duration_seconds=request.duration_seconds,
+            )
         )
-    )
+    except DuplicatePracticeAttemptError as error:
+        raise HTTPException(
+            status_code=409,
+            detail="该题目版本已完成练习，请选择下一题",
+        ) from error
     return PracticeAnswerResponse(
         question_id=attempt.question.question_id,
         content_version=attempt.question.content_version,

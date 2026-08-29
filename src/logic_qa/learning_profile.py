@@ -29,6 +29,7 @@ class LearningRecordInput:
     error_tags: tuple[str, ...] = ()
     knowledge_tags: tuple[str, ...] = ()
     duration_seconds: int | None = None
+    content_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,12 +39,17 @@ class LearningRecord:
     record_id: str
     user_id: str
     question_id: str
+    content_version: str | None
     question_type: str
     is_correct: bool
     error_tags: tuple[str, ...]
     knowledge_tags: tuple[str, ...]
     duration_seconds: int | None
     created_at: str
+
+
+class DuplicatePracticeAttemptError(ValueError):
+    """当前用户已完成同一不可变题目版本的练习。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +88,11 @@ class LearningProfileStore:
                     "create_learning_records",
                     self._migrate_v1,
                 ),
+                DatabaseMigration(
+                    2,
+                    "add_versioned_practice_attempts",
+                    self._migrate_v2,
+                ),
             ),
         )
         self._database.migrate()
@@ -103,39 +114,31 @@ class LearningProfileStore:
         self._database.restore(backup)
 
     def add_record(self, record: LearningRecordInput) -> LearningRecord:
-        """写入一条已校验的用户学习记录。"""
-        _validate_record_input(record)
-        saved = LearningRecord(
-            record_id=str(uuid4()),
-            user_id=record.user_id.strip(),
-            question_id=record.question_id.strip(),
-            question_type=record.question_type.strip(),
-            is_correct=record.is_correct,
-            error_tags=_normalize_tags(record.error_tags),
-            knowledge_tags=_normalize_tags(record.knowledge_tags),
-            duration_seconds=record.duration_seconds,
-            created_at=datetime.now(UTC).isoformat(),
-        )
+        """写入一条不绑定发布版本的最小学习记录。"""
+        if record.content_version is not None:
+            raise ValueError("通用学习记录不能绑定题目内容版本")
+        saved = _new_learning_record(record)
         with self._connect() as connection:
-            connection.execute(
+            _insert_learning_record(connection, saved)
+        return saved
+
+    def record_practice_attempt(self, record: LearningRecordInput) -> LearningRecord:
+        """原子写入当前用户对同一发布版本的唯一练习作答。"""
+        if record.content_version is None:
+            raise ValueError("练习作答必须指定题目内容版本")
+        saved = _new_learning_record(record)
+        with self._connect() as connection:
+            cursor = connection.execute(
                 """
-                INSERT INTO learning_records (
-                    record_id, user_id, question_id, question_type, is_correct,
-                    error_tags, knowledge_tags, duration_seconds, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO learning_records (
+                    record_id, user_id, question_id, content_version, question_type,
+                    is_correct, error_tags, knowledge_tags, duration_seconds, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    saved.record_id,
-                    saved.user_id,
-                    saved.question_id,
-                    saved.question_type,
-                    int(saved.is_correct),
-                    _serialize_tags(saved.error_tags),
-                    _serialize_tags(saved.knowledge_tags),
-                    saved.duration_seconds,
-                    saved.created_at,
-                ),
+                _learning_record_values(saved),
             )
+        if cursor.rowcount != 1:
+            raise DuplicatePracticeAttemptError("该题目版本已完成练习")
         return saved
 
     def get_profile(self, user_id: str) -> LearningProfile:
@@ -170,7 +173,7 @@ class LearningProfileStore:
         return cursor.rowcount == 1
 
     def attempted_question_ids(self, user_id: str) -> tuple[str, ...]:
-        """返回指定用户已尝试题目标识，用于排除重复推荐。"""
+        """兼容旧调用：返回当前用户全部学习记录涉及的题目标识。"""
         normalized_user_id = _validate_identifier(user_id, "用户标识")
         with self._connect() as connection:
             rows = connection.execute(
@@ -183,6 +186,24 @@ class LearningProfileStore:
                 (normalized_user_id,),
             ).fetchall()
         return tuple(row["question_id"] for row in rows)
+
+    def attempted_practice_versions(self, user_id: str) -> tuple[tuple[str, str], ...]:
+        """返回当前用户已完成的精确发布版本，用于版本感知的推荐去重。"""
+        normalized_user_id = _validate_identifier(user_id, "用户标识")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT question_id, content_version
+                FROM learning_records
+                WHERE user_id = ? AND content_version IS NOT NULL
+                ORDER BY question_id ASC, content_version ASC
+                """,
+                (normalized_user_id,),
+            ).fetchall()
+        return tuple(
+            (row["question_id"], row["content_version"])
+            for row in rows
+        )
 
     def _migrate_v1(self, connection: sqlite3.Connection) -> None:
         """创建学习记录表及其用户范围查询索引。"""
@@ -208,12 +229,26 @@ class LearningProfileStore:
             """
         )
 
+    def _migrate_v2(self, connection: sqlite3.Connection) -> None:
+        """为发布题练习添加内容版本与用户范围唯一性约束。"""
+        connection.execute(
+            "ALTER TABLE learning_records ADD COLUMN content_version TEXT"
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX idx_learning_records_practice_version
+            ON learning_records (user_id, question_id, content_version)
+            WHERE content_version IS NOT NULL
+            """
+        )
+
     def _records_for_user(self, user_id: str) -> tuple[LearningRecord, ...]:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT record_id, user_id, question_id, question_type, is_correct,
-                       error_tags, knowledge_tags, duration_seconds, created_at
+                SELECT record_id, user_id, question_id, content_version,
+                       question_type, is_correct, error_tags, knowledge_tags,
+                       duration_seconds, created_at
                 FROM learning_records
                 WHERE user_id = ?
                 ORDER BY created_at ASC
@@ -234,10 +269,64 @@ class LearningProfileStore:
             connection.close()
 
 
+def _new_learning_record(record: LearningRecordInput) -> LearningRecord:
+    """校验并规范化输入后，生成尚未持久化的学习记录。"""
+    _validate_record_input(record)
+    content_version = (
+        _validate_identifier(record.content_version, "内容版本")
+        if record.content_version is not None
+        else None
+    )
+    return LearningRecord(
+        record_id=str(uuid4()),
+        user_id=record.user_id.strip(),
+        question_id=record.question_id.strip(),
+        content_version=content_version,
+        question_type=record.question_type.strip(),
+        is_correct=record.is_correct,
+        error_tags=_normalize_tags(record.error_tags),
+        knowledge_tags=_normalize_tags(record.knowledge_tags),
+        duration_seconds=record.duration_seconds,
+        created_at=datetime.now(UTC).isoformat(),
+    )
+
+
+def _insert_learning_record(
+    connection: sqlite3.Connection,
+    record: LearningRecord,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO learning_records (
+            record_id, user_id, question_id, content_version, question_type,
+            is_correct, error_tags, knowledge_tags, duration_seconds, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        _learning_record_values(record),
+    )
+
+
+def _learning_record_values(record: LearningRecord) -> tuple[object, ...]:
+    return (
+        record.record_id,
+        record.user_id,
+        record.question_id,
+        record.content_version,
+        record.question_type,
+        int(record.is_correct),
+        _serialize_tags(record.error_tags),
+        _serialize_tags(record.knowledge_tags),
+        record.duration_seconds,
+        record.created_at,
+    )
+
+
 def _validate_record_input(record: LearningRecordInput) -> None:
     _validate_identifier(record.user_id, "用户标识")
     _validate_identifier(record.question_id, "题目标识")
     _validate_identifier(record.question_type, "题型")
+    if record.content_version is not None:
+        _validate_identifier(record.content_version, "内容版本")
     if record.duration_seconds is not None and record.duration_seconds < 0:
         raise ValueError("作答时长不能为负数")
     _normalize_tags(record.error_tags)
@@ -275,6 +364,7 @@ def _record_from_row(row: sqlite3.Row) -> LearningRecord:
         record_id=row["record_id"],
         user_id=row["user_id"],
         question_id=row["question_id"],
+        content_version=row["content_version"],
         question_type=row["question_type"],
         is_correct=bool(row["is_correct"]),
         error_tags=_deserialize_tags(row["error_tags"]),
