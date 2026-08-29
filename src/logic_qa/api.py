@@ -144,6 +144,7 @@ def _question_bank_dependencies_override() -> QuestionBankDependencies:
     return QuestionBankDependencies(
         question_bank_store=question_bank_store,
         review_store=review_store,
+        learning_store=learning_store,
     )
 
 
@@ -543,6 +544,7 @@ class PracticeCorrectionOutcomeResponse(BaseModel):
     message: str
     created_at: str
     resolved_at: str | None
+    republished_content_version: str | None = None
 
 
 class LearningRecordResponse(BaseModel):
@@ -994,6 +996,7 @@ def get_practice_correction_requests(
 @app.get(
     "/v1/learning/practice-correction-outcomes",
     response_model=list[PracticeCorrectionOutcomeResponse],
+    response_model_exclude_none=True,
 )
 def get_practice_correction_outcomes(
     identity: CurrentIdentity,
@@ -1005,7 +1008,33 @@ def get_practice_correction_outcomes(
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    return [_practice_correction_outcome_to_response(item) for item in outcomes]
+    return [
+        _practice_correction_outcome_to_response(
+            item,
+            republished_content_version=_verified_republished_content_version(item),
+        )
+        for item in outcomes
+    ]
+
+
+def _verified_republished_content_version(
+    outcome: PracticeCorrectionOutcome,
+) -> str | None:
+    """仅在题库仍保存精确摘要的发布事实时向学习者展示关联版本。"""
+    if outcome.republished_content_version is None:
+        return None
+    republication = learning_store.get_practice_correction_republication(
+        outcome.request_id
+    )
+    if republication is None:
+        return None
+    published = question_bank_store.get_published_question(
+        outcome.question_id,
+        republication.new_content_version,
+    )
+    if published is None or published.content_hash != republication.new_content_hash:
+        return None
+    return published.content_version
 
 
 @app.get(
@@ -1275,17 +1304,29 @@ def _admin_practice_correction_request_to_response(
 
 def _practice_correction_outcome_to_response(
     outcome: PracticeCorrectionOutcome,
+    *,
+    republished_content_version: str | None = None,
 ) -> PracticeCorrectionOutcomeResponse:
     """转换安全派生处置视图，不返回申请理由或管理员内部信息。"""
+    message = outcome.message
+    if (
+        outcome.republished_content_version is not None
+        and republished_content_version is None
+    ):
+        message = (
+            "复核已完成，该题目将按发布流程复核；若发布新版本，"
+            "新版本会作为独立练习重新推荐。"
+        )
     return PracticeCorrectionOutcomeResponse(
         request_id=outcome.request_id,
         record_id=outcome.record_id,
         question_id=outcome.question_id,
         content_version=outcome.content_version,
         kind=outcome.kind,
-        message=outcome.message,
+        message=message,
         created_at=outcome.created_at,
         resolved_at=outcome.resolved_at,
+        republished_content_version=republished_content_version,
     )
 
 

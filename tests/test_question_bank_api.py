@@ -132,6 +132,7 @@ def test_question_bank_routes_are_registered_once() -> None:
         "/v1/admin/question-reviews",
         "/v1/admin/question-reviews/{question_id}/{content_version}/{content_hash}",
         "/v1/admin/questions",
+        "/v1/admin/questions/{question_id}/{content_version}/correction-republication-links",
     }
     assert expected_paths <= registered_paths
 
@@ -955,6 +956,255 @@ def test_republication_outcome_projects_safely_and_new_version_is_recommended(
     assert recommendations.json()[0]["question"]["content_version"] == "content-v2"
     assert profile.json()["total_attempts"] == 1
     assert profile.json()["correct_attempts"] == 0
+
+
+def test_correction_republication_link_requires_published_active_version(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """关联只接受同题的活动新版本，并由题库摘要而非客户端参数作为审计事实。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    first_payload = _publish_payload("q-1", "content-v1")
+    _prepare_and_approve(client, first_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=first_payload,
+    ).status_code == 200
+    question_backup = api.question_bank_store.create_backup(
+        tmp_path / "question-backups"
+    )
+    attempt = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "A"},
+    )
+    assert attempt.status_code == 200
+    correction_request = client.post(
+        "/v1/learning/practice-correction-requests",
+        headers=_LEARNER_HEADERS,
+        json={"record_id": attempt.json()["record_id"], "reason": "请复核题目版本"},
+    )
+    assert correction_request.status_code == 200
+    request_id = correction_request.json()["request_id"]
+    assert client.post(
+        f"/v1/admin/practice-correction-requests/{request_id}/resolution",
+        headers=_ADMIN_HEADERS,
+        json={"resolution": "republication_required"},
+    ).status_code == 200
+
+    new_version_path = (
+        "/v1/admin/questions/q-1/content-v2/correction-republication-links"
+    )
+    before_publication = client.post(
+        new_version_path,
+        headers=_ADMIN_HEADERS,
+        json={"request_id": request_id, "previous_content_version": "content-v1"},
+    )
+    unauthenticated = client.post(
+        new_version_path,
+        json={"request_id": request_id, "previous_content_version": "content-v1"},
+    )
+    learner = client.post(
+        new_version_path,
+        headers=_LEARNER_HEADERS,
+        json={"request_id": request_id, "previous_content_version": "content-v1"},
+    )
+    invalid_payload = client.post(
+        new_version_path,
+        headers=_ADMIN_HEADERS,
+        json={
+            "request_id": request_id,
+            "previous_content_version": "content-v1",
+            "new_content_hash": "f" * 64,
+        },
+    )
+
+    assert before_publication.status_code == 422
+    assert before_publication.json()["detail"] == "未找到可关联的已发布新版本"
+    assert unauthenticated.status_code == 401
+    assert learner.status_code == 403
+    assert invalid_payload.status_code == 422
+
+    second_payload = {
+        **_publish_payload("q-1", "content-v2"),
+        "stem": "q-1 的复核后新版题干",
+    }
+    candidate = _prepare_and_approve(client, second_payload)
+    second_published = client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=second_payload,
+    )
+    assert second_published.status_code == 200
+
+    linked = client.post(
+        new_version_path,
+        headers=_ADMIN_HEADERS,
+        json={"request_id": request_id, "previous_content_version": "content-v1"},
+    )
+    duplicate = client.post(
+        new_version_path,
+        headers=_ADMIN_HEADERS,
+        json={"request_id": request_id, "previous_content_version": "content-v1"},
+    )
+    outcomes = client.get(
+        "/v1/learning/practice-correction-outcomes",
+        headers=_LEARNER_HEADERS,
+    )
+    recommendations = client.get(
+        "/v1/learning/recommendations",
+        headers=_LEARNER_HEADERS,
+    )
+    profile = client.get("/v1/learning/profile", headers=_LEARNER_HEADERS)
+
+    assert linked.status_code == 200
+    assert linked.json()["question_id"] == "q-1"
+    assert linked.json()["previous_content_version"] == "content-v1"
+    assert linked.json()["new_content_version"] == "content-v2"
+    assert linked.json()["new_content_hash"] == candidate["content_hash"]
+    assert linked.json()["linked_by"] == "admin-a"
+    assert duplicate.status_code == 409
+    assert duplicate.json()["detail"] == "该复核申请已关联新的发布版本"
+    assert outcomes.status_code == 200
+    assert outcomes.json()[0]["message"] == "复核后的新版本已发布，可作为独立练习完成。"
+    assert outcomes.json()[0]["republished_content_version"] == "content-v2"
+    for forbidden_field in (
+        "reason",
+        "resolved_by",
+        "resolution_notes",
+        "content_hash",
+        "linked_by",
+        "new_content_hash",
+    ):
+        assert forbidden_field not in outcomes.json()[0]
+    assert recommendations.status_code == 200
+    assert recommendations.json()[0]["question"]["content_version"] == "content-v2"
+    assert profile.json()["total_attempts"] == 1
+    assert profile.json()["correct_attempts"] == 0
+
+    api.question_bank_store.restore_backup(
+        api.question_bank_store.load_backup(question_backup.manifest_path)
+    )
+    restored_outcomes = client.get(
+        "/v1/learning/practice-correction-outcomes",
+        headers=_LEARNER_HEADERS,
+    )
+
+    assert restored_outcomes.status_code == 200
+    assert restored_outcomes.json()[0]["message"] == (
+        "复核已完成，该题目将按发布流程复核；若发布新版本，"
+        "新版本会作为独立练习重新推荐。"
+    )
+    assert "republished_content_version" not in restored_outcomes.json()[0]
+
+
+def test_correction_republication_link_rejects_non_republication_or_mismatched_request(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """关联仅可用于同题、同旧版本且已标记重发布的申请。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    first_payload = _publish_payload("q-1", "content-v1")
+    _prepare_and_approve(client, first_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=first_payload,
+    ).status_code == 200
+    attempt = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "A"},
+    )
+    assert attempt.status_code == 200
+    correction_request = client.post(
+        "/v1/learning/practice-correction-requests",
+        headers=_LEARNER_HEADERS,
+        json={"record_id": attempt.json()["record_id"], "reason": "请确认判分"},
+    )
+    assert correction_request.status_code == 200
+    request_id = correction_request.json()["request_id"]
+    assert client.post(
+        f"/v1/admin/practice-correction-requests/{request_id}/resolution",
+        headers=_ADMIN_HEADERS,
+        json={"resolution": "record_confirmed"},
+    ).status_code == 200
+
+    second_payload = _publish_payload("q-1", "content-v2")
+    _prepare_and_approve(client, second_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=second_payload,
+    ).status_code == 200
+    new_version_path = (
+        "/v1/admin/questions/q-1/content-v2/correction-republication-links"
+    )
+    confirmed = client.post(
+        new_version_path,
+        headers=_ADMIN_HEADERS,
+        json={"request_id": request_id, "previous_content_version": "content-v1"},
+    )
+    old_version_path = (
+        "/v1/admin/questions/q-1/content-v1/correction-republication-links"
+    )
+    inactive_old_version = client.post(
+        old_version_path,
+        headers=_ADMIN_HEADERS,
+        json={"request_id": request_id, "previous_content_version": "content-v1"},
+    )
+
+    second_question_first_payload = _publish_payload("q-2", "content-v1")
+    _prepare_and_approve(client, second_question_first_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=second_question_first_payload,
+    ).status_code == 200
+    second_attempt = client.post(
+        "/v1/learning/questions/q-2/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "A"},
+    )
+    assert second_attempt.status_code == 200
+    second_request = client.post(
+        "/v1/learning/practice-correction-requests",
+        headers=_LEARNER_HEADERS,
+        json={
+            "record_id": second_attempt.json()["record_id"],
+            "reason": "请复核另一道题目",
+        },
+    )
+    assert second_request.status_code == 200
+    assert client.post(
+        "/v1/admin/practice-correction-requests/"
+        f"{second_request.json()['request_id']}/resolution",
+        headers=_ADMIN_HEADERS,
+        json={"resolution": "republication_required"},
+    ).status_code == 200
+    second_question_new_payload = _publish_payload("q-2", "content-v2")
+    _prepare_and_approve(client, second_question_new_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=second_question_new_payload,
+    ).status_code == 200
+    cross_question = client.post(
+        new_version_path,
+        headers=_ADMIN_HEADERS,
+        json={
+            "request_id": second_request.json()["request_id"],
+            "previous_content_version": "content-v1",
+        },
+    )
+
+    assert confirmed.status_code == 422
+    assert confirmed.json()["detail"] == "该复核申请不需要重新发布"
+    assert inactive_old_version.status_code == 422
+    assert inactive_old_version.json()["detail"] == "未找到可关联的已发布新版本"
+    assert cross_question.status_code == 422
+    assert cross_question.json()["detail"] == "复核申请与待关联题目版本不一致"
 
 
 def test_practice_attempt_record_cannot_be_deleted_by_its_owner(

@@ -711,6 +711,35 @@ def test_recommendation_excludes_attempted_questions_and_hides_internal_tags(
     assert not hasattr(recommendation.question, "error_tags")
 
 
+def test_get_active_published_question_returns_current_audited_version(
+    tmp_path: Path,
+) -> None:
+    """治理链路只能读取当前活动版本，且保留其可信内容摘要和形式化资产。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    candidate, review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    published = question_store.publish(candidate, "publisher-a", review)
+
+    active = question_store.get_active_published_question("q-1", "content-v1")
+
+    assert active == published
+    assert active.content_hash == candidate.content_hash
+    assert active.formalization.expected_answer == "B"
+    assert question_store.get_published_question("q-1", "content-v1") == published
+    assert question_store.get_published_question("missing", "content-v1") is None
+    assert question_store.get_active_published_question("missing", "content-v1") is None
+    with pytest.raises(ValueError, match="题目标识不能为空"):
+        question_store.get_active_published_question(" ", "content-v1")
+    with pytest.raises(ValueError, match="内容版本不能为空"):
+        question_store.get_active_published_question("q-1", " ")
+    with pytest.raises(ValueError, match="内容版本不能为空"):
+        question_store.get_published_question("q-1", " ")
+
+
 def test_get_active_learner_question_hides_internal_fields_and_history(
     tmp_path: Path,
 ) -> None:

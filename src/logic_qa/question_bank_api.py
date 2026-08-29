@@ -17,6 +17,13 @@ from logic_qa.grouping_matching_solver import (
     MatchConstraintType,
     MatchingSolveStatus,
 )
+from logic_qa.learning_profile import (
+    LearningProfileStore,
+    PracticeCorrectionRepublication,
+    PracticeCorrectionRepublicationAlreadyLinkedError,
+    PracticeCorrectionRepublicationNotEligibleError,
+    PracticeCorrectionRepublicationVersionAlreadyLinkedError,
+)
 from logic_qa.models import VerificationStatus
 from logic_qa.ordering_solver import (
     OrderingConstraint,
@@ -298,6 +305,27 @@ class AdminPublishedQuestionResponse(QuestionCandidateResponse):
     published_at: str
 
 
+class CorrectionRepublicationLinkRequest(BaseModel):
+    """管理员将需要重新发布的申请绑定到已通过门禁的新发布版本。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    previous_content_version: str
+
+
+class CorrectionRepublicationLinkResponse(BaseModel):
+    """管理员可审计的复核申请与新发布版本关联。"""
+
+    request_id: str
+    question_id: str
+    previous_content_version: str
+    new_content_version: str
+    new_content_hash: str
+    linked_by: str
+    linked_at: str
+
+
 class QuestionBankDependencies:
     """题库管理路由所需的可替换存储依赖。"""
 
@@ -305,9 +333,11 @@ class QuestionBankDependencies:
         self,
         question_bank_store: QuestionBankStore,
         review_store: QuestionReviewStore,
+        learning_store: LearningProfileStore,
     ) -> None:
         self.question_bank_store = question_bank_store
         self.review_store = review_store
+        self.learning_store = learning_store
 
 
 def get_question_bank_dependencies(request: Request) -> QuestionBankDependencies:
@@ -316,6 +346,7 @@ def get_question_bank_dependencies(request: Request) -> QuestionBankDependencies
     return QuestionBankDependencies(
         question_bank_store=app_state.question_bank_store,
         review_store=app_state.review_store,
+        learning_store=app_state.learning_store,
     )
 
 
@@ -452,6 +483,49 @@ def publish_question(
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     return _admin_published_question_to_response(question)
+
+
+@router.post(
+    "/questions/{question_id}/{content_version}/correction-republication-links",
+    response_model=CorrectionRepublicationLinkResponse,
+)
+def link_correction_republication(
+    question_id: str,
+    content_version: str,
+    request: CorrectionRepublicationLinkRequest,
+    identity: AdminIdentity,
+    dependencies: QuestionBankDependenciesInput,
+) -> CorrectionRepublicationLinkResponse:
+    """只在新版本已发布且活动时，追加该版本与需要复核申请的关联。"""
+    try:
+        published = dependencies.question_bank_store.get_active_published_question(
+            question_id,
+            content_version,
+        )
+        if published is None:
+            raise ValueError("未找到可关联的已发布新版本")
+        republication = (
+            dependencies.learning_store.link_practice_correction_republication(
+                request_id=request.request_id,
+                question_id=published.question_id,
+                previous_content_version=request.previous_content_version,
+                new_content_version=published.content_version,
+                new_content_hash=published.content_hash,
+                linked_by=identity.subject,
+            )
+        )
+    except (
+        PracticeCorrectionRepublicationAlreadyLinkedError,
+        PracticeCorrectionRepublicationVersionAlreadyLinkedError,
+    ) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except PracticeCorrectionRepublicationNotEligibleError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if republication is None:
+        raise HTTPException(status_code=404, detail="未找到复核申请")
+    return _correction_republication_link_to_response(republication)
 
 
 def _publication_from_request(
@@ -667,6 +741,21 @@ def _option_assertions_to_response(
         )
         for assertion in assertions
     ]
+
+
+def _correction_republication_link_to_response(
+    republication: PracticeCorrectionRepublication,
+) -> CorrectionRepublicationLinkResponse:
+    """返回管理员可审计的关联，不把学习记录或题目答案写入关联。"""
+    return CorrectionRepublicationLinkResponse(
+        request_id=republication.request_id,
+        question_id=republication.question_id,
+        previous_content_version=republication.previous_content_version,
+        new_content_version=republication.new_content_version,
+        new_content_hash=republication.new_content_hash,
+        linked_by=republication.linked_by,
+        linked_at=republication.linked_at,
+    )
 
 
 def _question_candidate_to_response(

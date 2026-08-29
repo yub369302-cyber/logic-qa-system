@@ -22,6 +22,10 @@ _PRACTICE_CORRECTION_REQUEST_COLUMNS = """
     request_id, record_id, user_id, question_id, content_version, reason, status,
     created_at, resolved_by, resolution_notes, resolved_at
 """
+_PRACTICE_CORRECTION_REPUBLICATION_COLUMNS = """
+    request_id, question_id, previous_content_version, new_content_version,
+    new_content_hash, linked_by, linked_at
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +97,18 @@ class PracticeCorrectionRequestAlreadyResolvedError(ValueError):
     """更正申请已处置，不能覆盖既有治理结论。"""
 
 
+class PracticeCorrectionRepublicationNotEligibleError(ValueError):
+    """仅需要重新发布的更正申请可关联到新的已发布题目版本。"""
+
+
+class PracticeCorrectionRepublicationAlreadyLinkedError(ValueError):
+    """同一更正申请已经不可变地关联到一个新发布版本。"""
+
+
+class PracticeCorrectionRepublicationVersionAlreadyLinkedError(ValueError):
+    """同一题目的一个新发布版本已经不可变地关联到另一申请。"""
+
+
 @dataclass(frozen=True, slots=True)
 class PracticeCorrectionRequestInput:
     """学习者对自身不可变练习记录提交的最小复核申请。"""
@@ -141,6 +157,20 @@ class PracticeCorrectionOutcome:
     message: str
     created_at: str
     resolved_at: str | None
+    republished_content_version: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PracticeCorrectionRepublication:
+    """管理员将复核申请关联到独立新发布版本的不可变审计记录。"""
+
+    request_id: str
+    question_id: str
+    previous_content_version: str
+    new_content_version: str
+    new_content_hash: str
+    linked_by: str
+    linked_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +218,11 @@ class LearningProfileStore:
                     3,
                     "add_practice_correction_requests",
                     self._migrate_v3,
+                ),
+                DatabaseMigration(
+                    4,
+                    "add_practice_correction_republications",
+                    self._migrate_v4,
                 ),
             ),
         )
@@ -386,7 +421,150 @@ class LearningProfileStore:
     ) -> tuple[PracticeCorrectionOutcome, ...]:
         """返回当前用户的最小派生处置视图，不改写历史作答或题库状态。"""
         requests = self.list_practice_correction_requests_for_user(user_id)
-        return tuple(_practice_correction_outcome_from(request) for request in requests)
+        republications = self._republications_by_request_id(
+            request.request_id for request in requests
+        )
+        return tuple(
+            _practice_correction_outcome_from(
+                request,
+                republications.get(request.request_id),
+            )
+            for request in requests
+        )
+
+    def link_practice_correction_republication(
+        self,
+        *,
+        request_id: str,
+        question_id: str,
+        previous_content_version: str,
+        new_content_version: str,
+        new_content_hash: str,
+        linked_by: str,
+    ) -> PracticeCorrectionRepublication | None:
+        """把需要重发布的申请原子关联到同题的独立新版本，不修改练习账本。"""
+        normalized_request_id = _validate_identifier(request_id, "复核申请标识")
+        normalized_question_id = _validate_identifier(question_id, "题目标识")
+        normalized_previous_version = _validate_identifier(
+            previous_content_version,
+            "原内容版本",
+        )
+        normalized_new_version = _validate_identifier(new_content_version, "新内容版本")
+        normalized_new_hash = _validate_content_hash(new_content_hash)
+        normalized_linked_by = _validate_identifier(linked_by, "关联人标识")
+        if normalized_new_version == normalized_previous_version:
+            raise ValueError("复核重发布必须关联新的内容版本")
+        linked_at = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            request = connection.execute(
+                f"""
+                SELECT {_PRACTICE_CORRECTION_REQUEST_COLUMNS}
+                FROM practice_correction_requests
+                WHERE request_id = ?
+                """,
+                (normalized_request_id,),
+            ).fetchone()
+            if request is None:
+                return None
+            correction_request = _practice_correction_request_from_row(request)
+            if (
+                correction_request.status
+                is not PracticeCorrectionRequestStatus.REPUBLICATION_REQUIRED
+            ):
+                raise PracticeCorrectionRepublicationNotEligibleError(
+                    "该复核申请不需要重新发布"
+                )
+            if (
+                correction_request.question_id != normalized_question_id
+                or correction_request.content_version != normalized_previous_version
+            ):
+                raise ValueError("复核申请与待关联题目版本不一致")
+            existing_for_request = connection.execute(
+                """
+                SELECT request_id
+                FROM practice_correction_republications
+                WHERE request_id = ?
+                """,
+                (normalized_request_id,),
+            ).fetchone()
+            if existing_for_request is not None:
+                raise PracticeCorrectionRepublicationAlreadyLinkedError(
+                    "该复核申请已关联新的发布版本"
+                )
+            existing_for_version = connection.execute(
+                """
+                SELECT request_id
+                FROM practice_correction_republications
+                WHERE question_id = ? AND new_content_version = ?
+                """,
+                (normalized_question_id, normalized_new_version),
+            ).fetchone()
+            if existing_for_version is not None:
+                raise PracticeCorrectionRepublicationVersionAlreadyLinkedError(
+                    "该题目新发布版本已关联另一复核申请"
+                )
+            republication = PracticeCorrectionRepublication(
+                request_id=normalized_request_id,
+                question_id=normalized_question_id,
+                previous_content_version=normalized_previous_version,
+                new_content_version=normalized_new_version,
+                new_content_hash=normalized_new_hash,
+                linked_by=normalized_linked_by,
+                linked_at=linked_at,
+            )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO practice_correction_republications (
+                        request_id, question_id, previous_content_version,
+                        new_content_version, new_content_hash, linked_by, linked_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    _practice_correction_republication_values(republication),
+                )
+            except sqlite3.IntegrityError as error:
+                existing_for_request = connection.execute(
+                    """
+                    SELECT request_id
+                    FROM practice_correction_republications
+                    WHERE request_id = ?
+                    """,
+                    (normalized_request_id,),
+                ).fetchone()
+                if existing_for_request is not None:
+                    raise PracticeCorrectionRepublicationAlreadyLinkedError(
+                        "该复核申请已关联新的发布版本"
+                    ) from error
+                raise PracticeCorrectionRepublicationVersionAlreadyLinkedError(
+                    "该题目新发布版本已关联另一复核申请"
+                ) from error
+            _insert_practice_correction_event(
+                connection,
+                request_id=normalized_request_id,
+                actor_id=normalized_linked_by,
+                event_type="republication_linked",
+                status=correction_request.status,
+                notes=normalized_new_version,
+                created_at=linked_at,
+            )
+        return republication
+
+    def get_practice_correction_republication(
+        self,
+        request_id: str,
+    ) -> PracticeCorrectionRepublication | None:
+        """读取申请的不可变重发布关联，供跨存储投影精确核验。"""
+        normalized_request_id = _validate_identifier(request_id, "复核申请标识")
+        with self._connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT {_PRACTICE_CORRECTION_REPUBLICATION_COLUMNS}
+                FROM practice_correction_republications
+                WHERE request_id = ?
+                """,
+                (normalized_request_id,),
+            ).fetchone()
+        return _practice_correction_republication_from_row(row) if row else None
 
     def resolve_practice_correction_request(
         self,
@@ -568,6 +746,53 @@ class LearningProfileStore:
             """
         )
 
+    def _migrate_v4(self, connection: sqlite3.Connection) -> None:
+        """创建复核申请到新发布版本的一对一不可变关联与审计索引。"""
+        connection.execute(
+            """
+            CREATE TABLE practice_correction_republications (
+                request_id TEXT PRIMARY KEY,
+                question_id TEXT NOT NULL,
+                previous_content_version TEXT NOT NULL,
+                new_content_version TEXT NOT NULL,
+                new_content_hash TEXT NOT NULL,
+                linked_by TEXT NOT NULL,
+                linked_at TEXT NOT NULL,
+                UNIQUE (question_id, new_content_version)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX idx_practice_correction_republications_question_version
+            ON practice_correction_republications (
+                question_id, previous_content_version, new_content_version
+            )
+            """
+        )
+
+    def _republications_by_request_id(
+        self,
+        request_ids: Iterable[str],
+    ) -> dict[str, PracticeCorrectionRepublication]:
+        normalized_request_ids = tuple(request_ids)
+        if not normalized_request_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in normalized_request_ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {_PRACTICE_CORRECTION_REPUBLICATION_COLUMNS}
+                FROM practice_correction_republications
+                WHERE request_id IN ({placeholders})
+                """,
+                normalized_request_ids,
+            ).fetchall()
+        return {
+            row["request_id"]: _practice_correction_republication_from_row(row)
+            for row in rows
+        }
+
     def _records_for_user(self, user_id: str) -> tuple[LearningRecord, ...]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -665,6 +890,20 @@ def _practice_correction_request_values(
     )
 
 
+def _practice_correction_republication_values(
+    republication: PracticeCorrectionRepublication,
+) -> tuple[str, ...]:
+    return (
+        republication.request_id,
+        republication.question_id,
+        republication.previous_content_version,
+        republication.new_content_version,
+        republication.new_content_hash,
+        republication.linked_by,
+        republication.linked_at,
+    )
+
+
 def _insert_practice_correction_event(
     connection: sqlite3.Connection,
     *,
@@ -713,6 +952,7 @@ def _practice_correction_request_from_row(
 
 def _practice_correction_outcome_from(
     request: PracticeCorrectionRequest,
+    republication: PracticeCorrectionRepublication | None,
 ) -> PracticeCorrectionOutcome:
     kind = PracticeCorrectionOutcomeKind(request.status.value)
     messages = {
@@ -725,6 +965,13 @@ def _practice_correction_outcome_from(
             "新版本会作为独立练习重新推荐。"
         ),
     }
+    republished_content_version = (
+        republication.new_content_version if republication is not None else None
+    )
+    if republished_content_version is not None:
+        messages[PracticeCorrectionOutcomeKind.REPUBLICATION_REQUIRED] = (
+            "复核后的新版本已发布，可作为独立练习完成。"
+        )
     return PracticeCorrectionOutcome(
         request_id=request.request_id,
         record_id=request.record_id,
@@ -734,6 +981,21 @@ def _practice_correction_outcome_from(
         message=messages[kind],
         created_at=request.created_at,
         resolved_at=request.resolved_at,
+        republished_content_version=republished_content_version,
+    )
+
+
+def _practice_correction_republication_from_row(
+    row: sqlite3.Row,
+) -> PracticeCorrectionRepublication:
+    return PracticeCorrectionRepublication(
+        request_id=row["request_id"],
+        question_id=row["question_id"],
+        previous_content_version=row["previous_content_version"],
+        new_content_version=row["new_content_version"],
+        new_content_hash=row["new_content_hash"],
+        linked_by=row["linked_by"],
+        linked_at=row["linked_at"],
     )
 
 
@@ -755,6 +1017,15 @@ def _validate_identifier(value: str, label: str) -> str:
         raise ValueError(f"{label}不能为空")
     if len(normalized) > 128:
         raise ValueError(f"{label}不能超过 128 个字符")
+    return normalized
+
+
+def _validate_content_hash(value: str) -> str:
+    normalized = value.strip().lower()
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise ValueError("内容摘要必须是 64 位 SHA-256 十六进制字符串")
     return normalized
 
 

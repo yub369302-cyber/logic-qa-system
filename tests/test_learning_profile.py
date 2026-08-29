@@ -13,6 +13,9 @@ from logic_qa.learning_profile import (
     LearningProfileStore,
     LearningRecordInput,
     PracticeCorrectionOutcomeKind,
+    PracticeCorrectionRepublicationAlreadyLinkedError,
+    PracticeCorrectionRepublicationNotEligibleError,
+    PracticeCorrectionRepublicationVersionAlreadyLinkedError,
     PracticeCorrectionRequestAlreadyResolvedError,
     PracticeCorrectionRequestInput,
     PracticeCorrectionResolution,
@@ -185,7 +188,7 @@ def test_learning_store_migrates_once_and_restores_manifest_backup(
     reloaded_store.restore_backup(reloaded_backup)
 
     profile = reloaded_store.get_profile("user-a")
-    assert reloaded_store.schema_version() == 3
+    assert reloaded_store.schema_version() == 4
     assert backup.manifest_path.is_file()
     assert profile.total_attempts == 1
     assert reloaded_store.attempted_question_ids("user-a") == (first.question_id,)
@@ -248,7 +251,7 @@ def test_learning_store_upgrades_v1_records_to_versioned_practice_schema(
         )
     )
 
-    assert store.schema_version() == 3
+    assert store.schema_version() == 4
     assert store.get_profile("user-a").total_attempts == 2
     assert versioned_record.content_version == "content-v1"
     assert store.attempted_practice_versions("user-a") == (
@@ -571,6 +574,352 @@ def test_record_confirmed_outcome_preserves_original_attempt(tmp_path: Path) -> 
     assert store.attempted_practice_versions("user-a") == (("q-1", "content-v1"),)
 
 
+def test_correction_republication_link_is_immutable_and_updates_only_projection(
+    tmp_path: Path,
+) -> None:
+    """关联已发布新版本只追加审计，不重写旧练习账本或原始处置。"""
+    store = _store(tmp_path)
+    record = store.record_practice_attempt(
+        LearningRecordInput(
+            user_id="user-a",
+            question_id="q-1",
+            content_version="content-v1",
+            question_type="propositional",
+            is_correct=False,
+        )
+    )
+    requested = store.create_practice_correction_request(
+        PracticeCorrectionRequestInput(
+            user_id="user-a",
+            record_id=record.record_id,
+            reason="请复核题目版本",
+        )
+    )
+    assert requested is not None
+    resolved = store.resolve_practice_correction_request(
+        PracticeCorrectionResolutionInput(
+            request_id=requested.request_id,
+            resolver_id="admin-a",
+            resolution=PracticeCorrectionResolution.REPUBLICATION_REQUIRED,
+        )
+    )
+    assert resolved is not None
+    new_content_hash = "a" * 64
+
+    linked = store.link_practice_correction_republication(
+        request_id=requested.request_id,
+        question_id="q-1",
+        previous_content_version="content-v1",
+        new_content_version="content-v2",
+        new_content_hash=new_content_hash,
+        linked_by="admin-b",
+    )
+
+    assert linked is not None
+    assert linked.previous_content_version == "content-v1"
+    assert linked.new_content_version == "content-v2"
+    assert linked.new_content_hash == new_content_hash
+    outcomes = store.list_practice_correction_outcomes_for_user("user-a")
+    assert outcomes[0].kind is PracticeCorrectionOutcomeKind.REPUBLICATION_REQUIRED
+    assert outcomes[0].message == "复核后的新版本已发布，可作为独立练习完成。"
+    assert outcomes[0].republished_content_version == "content-v2"
+    assert store.get_profile("user-a").total_attempts == 1
+    assert store.get_profile("user-a").correct_attempts == 0
+    assert store.attempted_practice_versions("user-a") == (("q-1", "content-v1"),)
+
+    with pytest.raises(
+        PracticeCorrectionRepublicationAlreadyLinkedError,
+        match="已关联新的发布版本",
+    ):
+        store.link_practice_correction_republication(
+            request_id=requested.request_id,
+            question_id="q-1",
+            previous_content_version="content-v1",
+            new_content_version="content-v3",
+            new_content_hash="b" * 64,
+            linked_by="admin-c",
+        )
+
+    with sqlite3.connect(tmp_path / "learning.sqlite3") as connection:
+        events = connection.execute(
+            """
+            SELECT event_type, status, notes
+            FROM practice_correction_events
+            ORDER BY rowid ASC
+            """
+        ).fetchall()
+    assert events == [
+        ("requested", "pending", "请复核题目版本"),
+        ("resolved", "republication_required", None),
+        ("republication_linked", "republication_required", "content-v2"),
+    ]
+
+
+def test_correction_republication_link_cannot_reuse_new_version(
+    tmp_path: Path,
+) -> None:
+    """同题的新发布版本只能审计关联到一条更正申请。"""
+    store = _store(tmp_path)
+    request_ids = []
+    for user_id in ("user-a", "user-b"):
+        record = store.record_practice_attempt(
+            LearningRecordInput(
+                user_id=user_id,
+                question_id="q-1",
+                content_version="content-v1",
+                question_type="propositional",
+                is_correct=False,
+            )
+        )
+        requested = store.create_practice_correction_request(
+            PracticeCorrectionRequestInput(
+                user_id=user_id,
+                record_id=record.record_id,
+                reason="请复核题目内容",
+            )
+        )
+        assert requested is not None
+        store.resolve_practice_correction_request(
+            PracticeCorrectionResolutionInput(
+                request_id=requested.request_id,
+                resolver_id="admin-a",
+                resolution=PracticeCorrectionResolution.REPUBLICATION_REQUIRED,
+            )
+        )
+        request_ids.append(requested.request_id)
+
+    store.link_practice_correction_republication(
+        request_id=request_ids[0],
+        question_id="q-1",
+        previous_content_version="content-v1",
+        new_content_version="content-v2",
+        new_content_hash="a" * 64,
+        linked_by="admin-b",
+    )
+
+    with pytest.raises(
+        PracticeCorrectionRepublicationVersionAlreadyLinkedError,
+        match="已关联另一复核申请",
+    ):
+        store.link_practice_correction_republication(
+            request_id=request_ids[1],
+            question_id="q-1",
+            previous_content_version="content-v1",
+            new_content_version="content-v2",
+            new_content_hash="a" * 64,
+            linked_by="admin-b",
+        )
+
+
+def test_correction_republication_link_requires_matching_resolved_request(
+    tmp_path: Path,
+) -> None:
+    """非重发布结论、错误旧版本或同版本关联均不能写入关联审计。"""
+    store = _store(tmp_path)
+    record = store.record_practice_attempt(
+        LearningRecordInput(
+            user_id="user-a",
+            question_id="q-1",
+            content_version="content-v1",
+            question_type="propositional",
+            is_correct=False,
+        )
+    )
+    requested = store.create_practice_correction_request(
+        PracticeCorrectionRequestInput(
+            user_id="user-a",
+            record_id=record.record_id,
+            reason="请确认判分",
+        )
+    )
+    assert requested is not None
+    confirmed = store.resolve_practice_correction_request(
+        PracticeCorrectionResolutionInput(
+            request_id=requested.request_id,
+            resolver_id="admin-a",
+            resolution=PracticeCorrectionResolution.RECORD_CONFIRMED,
+        )
+    )
+    assert confirmed is not None
+
+    with pytest.raises(
+        PracticeCorrectionRepublicationNotEligibleError,
+        match="不需要重新发布",
+    ):
+        store.link_practice_correction_republication(
+            request_id=requested.request_id,
+            question_id="q-1",
+            previous_content_version="content-v1",
+            new_content_version="content-v2",
+            new_content_hash="a" * 64,
+            linked_by="admin-b",
+        )
+
+    republish_record = store.record_practice_attempt(
+        LearningRecordInput(
+            user_id="user-a",
+            question_id="q-2",
+            content_version="content-v1",
+            question_type="propositional",
+            is_correct=False,
+        )
+    )
+    republish_request = store.create_practice_correction_request(
+        PracticeCorrectionRequestInput(
+            user_id="user-a",
+            record_id=republish_record.record_id,
+            reason="请复核题目内容",
+        )
+    )
+    assert republish_request is not None
+    store.resolve_practice_correction_request(
+        PracticeCorrectionResolutionInput(
+            request_id=republish_request.request_id,
+            resolver_id="admin-a",
+            resolution=PracticeCorrectionResolution.REPUBLICATION_REQUIRED,
+        )
+    )
+
+    with pytest.raises(ValueError, match="复核申请与待关联题目版本不一致"):
+        store.link_practice_correction_republication(
+            request_id=republish_request.request_id,
+            question_id="q-2",
+            previous_content_version="content-v0",
+            new_content_version="content-v2",
+            new_content_hash="a" * 64,
+            linked_by="admin-b",
+        )
+    with pytest.raises(ValueError, match="必须关联新的内容版本"):
+        store.link_practice_correction_republication(
+            request_id=republish_request.request_id,
+            question_id="q-2",
+            previous_content_version="content-v1",
+            new_content_version="content-v1",
+            new_content_hash="a" * 64,
+            linked_by="admin-b",
+        )
+
+
+def test_learning_store_upgrades_v3_correction_schema_to_republication_schema(
+    tmp_path: Path,
+) -> None:
+    """已有更正申请账本升级只添加关联表，不回写历史申请或练习记录。"""
+    database_path = tmp_path / "learning.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO schema_migrations (version, name, applied_at)
+            VALUES (?, ?, '2026-08-29T00:00:00+00:00')
+            """,
+            [
+                (1, "create_learning_records"),
+                (2, "add_versioned_practice_attempts"),
+                (3, "add_practice_correction_requests"),
+            ],
+        )
+        connection.execute(
+            """
+            CREATE TABLE learning_records (
+                record_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                question_id TEXT NOT NULL,
+                question_type TEXT NOT NULL,
+                is_correct INTEGER NOT NULL CHECK (is_correct IN (0, 1)),
+                error_tags TEXT NOT NULL,
+                knowledge_tags TEXT NOT NULL,
+                duration_seconds INTEGER,
+                created_at TEXT NOT NULL,
+                content_version TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE practice_correction_requests (
+                request_id TEXT PRIMARY KEY,
+                record_id TEXT NOT NULL UNIQUE,
+                user_id TEXT NOT NULL,
+                question_id TEXT NOT NULL,
+                content_version TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                resolved_by TEXT,
+                resolution_notes TEXT,
+                resolved_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE practice_correction_events (
+                event_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                notes TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO learning_records (
+                record_id, user_id, question_id, question_type, is_correct,
+                error_tags, knowledge_tags, duration_seconds, created_at,
+                content_version
+            ) VALUES ('attempt-v1', 'user-a', 'q-1', 'propositional', 0,
+                      'invalid_converse', 'logic', NULL,
+                      '2026-08-29T00:00:00+00:00', 'content-v1')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO practice_correction_requests (
+                request_id, record_id, user_id, question_id, content_version,
+                reason, status, created_at, resolved_by, resolution_notes, resolved_at
+            ) VALUES ('request-v1', 'attempt-v1', 'user-a', 'q-1', 'content-v1',
+                      '请复核历史练习记录', 'republication_required',
+                      '2026-08-29T00:00:00+00:00', 'admin-a', NULL,
+                      '2026-08-29T01:00:00+00:00')
+            """
+        )
+
+    store = LearningProfileStore(database_path)
+
+    assert store.schema_version() == 4
+    assert store.get_profile("user-a").total_attempts == 1
+    assert store.list_practice_correction_requests_for_user("user-a")[0].request_id == (
+        "request-v1"
+    )
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(practice_correction_republications)"
+            ).fetchall()
+        }
+    assert columns == {
+        "request_id",
+        "question_id",
+        "previous_content_version",
+        "new_content_version",
+        "new_content_hash",
+        "linked_by",
+        "linked_at",
+    }
+
+
 def test_learning_store_upgrades_v2_ledger_to_correction_request_schema(
     tmp_path: Path,
 ) -> None:
@@ -633,7 +982,7 @@ def test_learning_store_upgrades_v2_ledger_to_correction_request_schema(
         )
     )
 
-    assert store.schema_version() == 3
+    assert store.schema_version() == 4
     assert request is not None
     assert request.status.value == "pending"
     assert store.get_profile("user-a").total_attempts == 1
@@ -644,7 +993,7 @@ def test_learning_store_upgrades_v2_ledger_to_correction_request_schema(
 def test_learning_store_restores_correction_request_and_audit_snapshot(
     tmp_path: Path,
 ) -> None:
-    """恢复学习库快照时应一并恢复申请当前状态与追加式处置事件。"""
+    """恢复学习库快照时应一并回退关联、当前状态与追加式处置事件。"""
     store = _store(tmp_path)
     record = store.record_practice_attempt(
         LearningRecordInput(
@@ -663,21 +1012,39 @@ def test_learning_store_restores_correction_request_and_audit_snapshot(
         )
     )
     assert requested is not None
-    backup = store.create_backup(tmp_path / "backups")
     resolved = store.resolve_practice_correction_request(
         PracticeCorrectionResolutionInput(
             request_id=requested.request_id,
             resolver_id="admin-a",
-            resolution=PracticeCorrectionResolution.RECORD_CONFIRMED,
+            resolution=PracticeCorrectionResolution.REPUBLICATION_REQUIRED,
         )
     )
     assert resolved is not None
-    assert resolved.status.value == "record_confirmed"
+    backup = store.create_backup(tmp_path / "backups")
+    store.link_practice_correction_republication(
+        request_id=requested.request_id,
+        question_id="q-1",
+        previous_content_version="content-v1",
+        new_content_version="content-v2",
+        new_content_hash="a" * 64,
+        linked_by="admin-a",
+    )
+    assert (
+        store.list_practice_correction_outcomes_for_user("user-a")[0]
+        .republished_content_version
+        == "content-v2"
+    )
 
     store.restore_backup(store.load_backup(backup.manifest_path))
 
     restored = store.list_practice_correction_requests_for_user("user-a")
-    assert restored == (requested,)
+    assert restored == (resolved,)
+    assert store.get_practice_correction_republication(requested.request_id) is None
+    assert (
+        store.list_practice_correction_outcomes_for_user("user-a")[0]
+        .republished_content_version
+        is None
+    )
     with sqlite3.connect(tmp_path / "learning.sqlite3") as connection:
         events = connection.execute(
             """
@@ -686,7 +1053,10 @@ def test_learning_store_restores_correction_request_and_audit_snapshot(
             ORDER BY rowid ASC
             """
         ).fetchall()
-    assert events == [("requested", "pending")]
+    assert events == [
+        ("requested", "pending"),
+        ("resolved", "republication_required"),
+    ]
 
 
 def test_learning_store_rejects_tampered_backup(tmp_path: Path) -> None:
