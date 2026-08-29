@@ -77,6 +77,14 @@ class PracticeCorrectionResolution(StrEnum):
     REPUBLICATION_REQUIRED = "republication_required"
 
 
+class PracticeCorrectionOutcomeKind(StrEnum):
+    """学习者可见的派生复核结论类型，不改变原始练习账本。"""
+
+    PENDING = "pending"
+    RECORD_CONFIRMED = "record_confirmed"
+    REPUBLICATION_REQUIRED = "republication_required"
+
+
 class DuplicatePracticeCorrectionRequestError(ValueError):
     """同一练习记录已经提交过受控更正申请。"""
 
@@ -118,6 +126,20 @@ class PracticeCorrectionRequest:
     created_at: str
     resolved_by: str | None
     resolution_notes: str | None
+    resolved_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PracticeCorrectionOutcome:
+    """由处置状态推导的学习者安全视图，不包含题库或管理员内部信息。"""
+
+    request_id: str
+    record_id: str
+    question_id: str
+    content_version: str
+    kind: PracticeCorrectionOutcomeKind
+    message: str
+    created_at: str
     resolved_at: str | None
 
 
@@ -357,6 +379,14 @@ class LearningProfileStore:
                 parameters,
             ).fetchall()
         return tuple(_practice_correction_request_from_row(row) for row in rows)
+
+    def list_practice_correction_outcomes_for_user(
+        self,
+        user_id: str,
+    ) -> tuple[PracticeCorrectionOutcome, ...]:
+        """返回当前用户的最小派生处置视图，不改写历史作答或题库状态。"""
+        requests = self.list_practice_correction_requests_for_user(user_id)
+        return tuple(_practice_correction_outcome_from(request) for request in requests)
 
     def resolve_practice_correction_request(
         self,
@@ -678,6 +708,32 @@ def _practice_correction_request_from_row(
         resolved_by=row["resolved_by"],
         resolution_notes=row["resolution_notes"],
         resolved_at=row["resolved_at"],
+    )
+
+
+def _practice_correction_outcome_from(
+    request: PracticeCorrectionRequest,
+) -> PracticeCorrectionOutcome:
+    kind = PracticeCorrectionOutcomeKind(request.status.value)
+    messages = {
+        PracticeCorrectionOutcomeKind.PENDING: "复核申请已提交，正在处理中。",
+        PracticeCorrectionOutcomeKind.RECORD_CONFIRMED: (
+            "复核已完成，当前练习记录已确认。"
+        ),
+        PracticeCorrectionOutcomeKind.REPUBLICATION_REQUIRED: (
+            "复核已完成，该题目将按发布流程复核；若发布新版本，"
+            "新版本会作为独立练习重新推荐。"
+        ),
+    }
+    return PracticeCorrectionOutcome(
+        request_id=request.request_id,
+        record_id=request.record_id,
+        question_id=request.question_id,
+        content_version=request.content_version,
+        kind=kind,
+        message=messages[kind],
+        created_at=request.created_at,
+        resolved_at=request.resolved_at,
     )
 
 

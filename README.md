@@ -163,6 +163,12 @@ API 适配层按职责拆分：`api.py` 负责应用装配、通用求解、学�
 
 管理员使用独立的管理端接口读取并终态处置申请。当前状态保存在 `practice_correction_requests`，创建与处置同时写入 `practice_correction_events` 追加式审计表；已经处置的申请不能再次覆盖。处置结果仅表示“原记录已确认”或“需要按题库发布流程复核”，不会直接修改 `learning_records` 中的首次服务端判分、版本去重键、学习概览基础或推荐排除状态。学习者只能读取自身申请的最小状态，不会得到管理员身份、处置备注、题库答案或内部形式化信息。
 
+### 阶段 7.7：更正处置衍生学习视图
+
+学习者可通过 `GET /v1/learning/practice-correction-outcomes` 读取仅由自身申请当前状态派生出的安全结果视图。`pending` 只提示处理中，`record_confirmed` 只确认既有记录，`republication_required` 只说明题目将进入发布流程复核；该视图不返回申请理由、管理员身份、处置备注、正确答案、标签或形式化资产，也不会新增可修改的业务状态。
+
+`republication_required` 不会自动改变原练习记录，更不会重新开放旧版本作答。只有管理员按照既有候选、审核、确定性形式化验证和发布门禁真正发布新的 `content_version` 后，版本化推荐才会把该新版本作为独立题目推荐给此前完成旧版本练习的学习者。由此，用户可获得明确状态说明，同时首次服务端判分、旧版本唯一作答约束与学习概览审计基础始终保持不变。
+
 ## 快速启动
 
 ```powershell
@@ -205,6 +211,6 @@ uv run python -m compileall -q src tests
 
 ## 主要接口与部署配置
 
-主要接口包括：`POST /v1/questions/solve` 用于结构化命题推理，`POST /v1/questions/solve-chinese` 用于中文条件解析、确认请求和确认后求解，`POST /v1/questions/verify-choice` 用于选择题选项验证，`POST /v1/questions/solve-ordering`、`solve-grouping` 和 `solve-matching` 用于组合约束题，`POST /v1/questions/ocr` 与 `/ocr/correct` 用于图片文字校正，`POST /v1/questions/review-solution` 用于结构化步骤批改，以及 `/v1/learning/*` 用于用户最小学习档案。`POST /v1/learning/practice-correction-requests` 允许学习者为自己的不可变发布题练习记录提交一次复核，`GET` 同一路径仅返回其最小申请状态；管理员可通过 `GET /v1/admin/practice-correction-requests` 查看申请，并以 `POST /v1/admin/practice-correction-requests/{request_id}/resolution` 追加终态处置。管理端的 `POST /v1/admin/question-candidates` 需提交完整形式化资产，`GET /v1/admin/question-candidates/{question_id}/{content_version}/{content_hash}` 可精确回查候选快照，`POST /v1/admin/questions` 会在发布前复算并记录形式化验证依据。
+主要接口包括：`POST /v1/questions/solve` 用于结构化命题推理，`POST /v1/questions/solve-chinese` 用于中文条件解析、确认请求和确认后求解，`POST /v1/questions/verify-choice` 用于选择题选项验证，`POST /v1/questions/solve-ordering`、`solve-grouping` 和 `solve-matching` 用于组合约束题，`POST /v1/questions/ocr` 与 `/ocr/correct` 用于图片文字校正，`POST /v1/questions/review-solution` 用于结构化步骤批改，以及 `/v1/learning/*` 用于用户最小学习档案。`POST /v1/learning/practice-correction-requests` 允许学习者为自己的不可变发布题练习记录提交一次复核，`GET` 同一路径仅返回其最小申请状态；`GET /v1/learning/practice-correction-outcomes` 返回不含内部信息的派生处置说明。管理员可通过 `GET /v1/admin/practice-correction-requests` 查看申请，并以 `POST /v1/admin/practice-correction-requests/{request_id}/resolution` 追加终态处置。管理端的 `POST /v1/admin/question-candidates` 需提交完整形式化资产，`GET /v1/admin/question-candidates/{question_id}/{content_version}/{content_hash}` 可精确回查候选快照，`POST /v1/admin/questions` 会在发布前复算并记录形式化验证依据。
 
 部署可通过 `LOGIC_QA_DATABASE_PATH`、`LOGIC_QA_REVIEW_DATABASE_PATH` 和 `LOGIC_QA_QUESTION_DATABASE_PATH` 指定 SQLite 文件路径。认证接口必须配置 `LOGIC_QA_TRUSTED_PROXY_TOKEN`；前置可信代理完成上游登录后，向服务注入 `X-Logic-QA-Proxy-Token`、`X-Logic-QA-Subject` 与 `X-Logic-QA-Roles`。学习者接口不再接收路径、查询参数或请求体中的用户标识，审核人与发布人也由认证主体自动写入。未配置代理密钥时身份相关接口默认关闭。OCR 默认依赖本地 Tesseract，未安装时会返回 503 和明确说明，不会伪造识别结果。
