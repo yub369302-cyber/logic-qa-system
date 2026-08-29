@@ -762,6 +762,77 @@ def test_admin_version_lifecycle_routes_preserve_immutable_practice_ledger(
     ).status_code == 200
 
 
+def test_republication_outcome_downgrades_when_question_bank_is_unavailable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """题库独立存储暂不可读时，学习者结果必须安全降级而非返回 500。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    first_payload = _publish_payload("q-1", "content-v1")
+    _prepare_and_approve(client, first_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=first_payload,
+    ).status_code == 200
+    attempt = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "A"},
+    )
+    assert attempt.status_code == 200
+    correction_request = client.post(
+        "/v1/learning/practice-correction-requests",
+        headers=_LEARNER_HEADERS,
+        json={"record_id": attempt.json()["record_id"], "reason": "需要重发布"},
+    )
+    assert correction_request.status_code == 200
+    request_id = correction_request.json()["request_id"]
+    assert client.post(
+        f"/v1/admin/practice-correction-requests/{request_id}/resolution",
+        headers=_ADMIN_HEADERS,
+        json={"resolution": "republication_required"},
+    ).status_code == 200
+    second_payload = {
+        **_publish_payload("q-1", "content-v2"),
+        "stem": "q-1 的暂不可读关联新版题干",
+    }
+    _prepare_and_approve(client, second_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=second_payload,
+    ).status_code == 200
+    assert client.post(
+        "/v1/admin/questions/q-1/content-v2/correction-republication-links",
+        headers=_ADMIN_HEADERS,
+        json={"request_id": request_id, "previous_content_version": "content-v1"},
+    ).status_code == 200
+
+    class UnavailableQuestionBankStore:
+        """模拟独立题库读取发生 SQLite 运行时错误。"""
+
+        def get_active_published_question(
+            self,
+            question_id: str,
+            content_version: str,
+        ) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(api, "question_bank_store", UnavailableQuestionBankStore())
+    outcome = client.get(
+        "/v1/learning/practice-correction-outcomes",
+        headers=_LEARNER_HEADERS,
+    )
+
+    assert outcome.status_code == 200
+    assert outcome.json()[0]["message"] == (
+        "复核已完成，该题目将按发布流程复核；若发布新版本，"
+        "新版本会作为独立练习重新推荐。"
+    )
+    assert "republished_content_version" not in outcome.json()[0]
+
+
 def test_republication_outcome_downgrades_when_linked_version_is_deactivated(
     tmp_path: Path,
     monkeypatch,
