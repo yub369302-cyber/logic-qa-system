@@ -990,6 +990,112 @@ def test_learning_store_upgrades_v2_ledger_to_correction_request_schema(
     assert store.attempted_practice_versions("user-a") == (("q-1", "content-v1"),)
 
 
+def test_practice_correction_audit_query_returns_immutable_link_and_event_chain(
+    tmp_path: Path,
+) -> None:
+    """管理员审计查询可按申请和版本回查完整事件链，不改写任何账本。"""
+    store = _store(tmp_path)
+    request_ids = []
+    for question_id, user_id in (("q-1", "user-a"), ("q-2", "user-b")):
+        record = store.record_practice_attempt(
+            LearningRecordInput(
+                user_id=user_id,
+                question_id=question_id,
+                content_version="content-v1",
+                question_type="propositional",
+                is_correct=False,
+            )
+        )
+        correction_request = store.create_practice_correction_request(
+            PracticeCorrectionRequestInput(
+                user_id=user_id,
+                record_id=record.record_id,
+                reason=f"请复核 {question_id}",
+            )
+        )
+        assert correction_request is not None
+        resolved = store.resolve_practice_correction_request(
+            PracticeCorrectionResolutionInput(
+                request_id=correction_request.request_id,
+                resolver_id="admin-a",
+                resolution=PracticeCorrectionResolution.REPUBLICATION_REQUIRED,
+            )
+        )
+        assert resolved is not None
+        request_ids.append(correction_request.request_id)
+
+    linked = store.link_practice_correction_republication(
+        request_id=request_ids[0],
+        question_id="q-1",
+        previous_content_version="content-v1",
+        new_content_version="content-v2",
+        new_content_hash="a" * 64,
+        linked_by="admin-b",
+    )
+    assert linked is not None
+
+    exact = store.get_practice_correction_audit(request_ids[0])
+    linked_only = store.list_practice_correction_audits(linked=True)
+    unlinked_only = store.list_practice_correction_audits(linked=False)
+    by_new_version = store.list_practice_correction_audits(
+        new_content_version="content-v2"
+    )
+    by_old_version = store.list_practice_correction_audits(
+        question_id="q-2",
+        content_version="content-v1",
+    )
+
+    assert exact is not None
+    assert exact.request.request_id == request_ids[0]
+    assert exact.republication == linked
+    assert [event.event_type for event in exact.events] == [
+        "requested",
+        "resolved",
+        "republication_linked",
+    ]
+    assert [event.actor_id for event in exact.events] == [
+        "user-a",
+        "admin-a",
+        "admin-b",
+    ]
+    assert [event.status.value for event in exact.events] == [
+        "pending",
+        "republication_required",
+        "republication_required",
+    ]
+    assert linked_only == (exact,)
+    assert len(unlinked_only) == 1
+    assert unlinked_only[0].request.request_id == request_ids[1]
+    assert unlinked_only[0].republication is None
+    assert [event.event_type for event in unlinked_only[0].events] == [
+        "requested",
+        "resolved",
+    ]
+    assert by_new_version == (exact,)
+    assert by_old_version == unlinked_only
+    assert store.get_profile("user-a").total_attempts == 1
+    assert store.get_profile("user-b").total_attempts == 1
+
+
+def test_practice_correction_audit_query_validates_filters_and_limit(
+    tmp_path: Path,
+) -> None:
+    """审计查询拒绝空标识与越界分页，不将错误条件静默放宽。"""
+    store = _store(tmp_path)
+
+    with pytest.raises(ValueError, match="题目标识不能为空"):
+        store.list_practice_correction_audits(question_id=" ")
+    with pytest.raises(ValueError, match="内容版本不能为空"):
+        store.list_practice_correction_audits(new_content_version=" ")
+    with pytest.raises(ValueError, match="数量必须介于 1 到 100"):
+        store.list_practice_correction_audits(limit=0)
+    with pytest.raises(ValueError, match="数量必须介于 1 到 100"):
+        store.list_practice_correction_audits(limit=101)
+    with pytest.raises(ValueError, match="复核申请标识不能为空"):
+        store.get_practice_correction_audit(" ")
+    assert store.get_practice_correction_audit("missing-request") is None
+
+
 def test_learning_store_restores_correction_request_and_audit_snapshot(
     tmp_path: Path,
 ) -> None:

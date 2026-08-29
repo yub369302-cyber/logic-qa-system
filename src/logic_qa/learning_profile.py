@@ -174,6 +174,28 @@ class PracticeCorrectionRepublication:
 
 
 @dataclass(frozen=True, slots=True)
+class PracticeCorrectionEvent:
+    """更正申请生命周期中的一条追加式审计事件。"""
+
+    event_id: str
+    request_id: str
+    actor_id: str
+    event_type: str
+    status: PracticeCorrectionRequestStatus
+    notes: str | None
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PracticeCorrectionAudit:
+    """管理员回查一条更正申请、其重发布关联和完整事件链的只读视图。"""
+
+    request: PracticeCorrectionRequest
+    republication: PracticeCorrectionRepublication | None
+    events: tuple[PracticeCorrectionEvent, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class LearningRecommendation:
     """基于用户自身统计生成的练习方向，而不是虚构题目。"""
 
@@ -566,6 +588,109 @@ class LearningProfileStore:
             ).fetchone()
         return _practice_correction_republication_from_row(row) if row else None
 
+    def get_practice_correction_audit(
+        self,
+        request_id: str,
+    ) -> PracticeCorrectionAudit | None:
+        """按申请标识回查关联与完整追加式事件链，不修改任何治理记录。"""
+        audits = self.list_practice_correction_audits(request_id=request_id, limit=1)
+        return audits[0] if audits else None
+
+    def list_practice_correction_audits(
+        self,
+        *,
+        request_id: str | None = None,
+        question_id: str | None = None,
+        content_version: str | None = None,
+        new_content_version: str | None = None,
+        linked: bool | None = None,
+        limit: int = 50,
+    ) -> tuple[PracticeCorrectionAudit, ...]:
+        """按精确申请、题目或版本筛选管理员审计视图，单次读取数量受限。"""
+        normalized_request_id = (
+            _validate_identifier(request_id, "复核申请标识")
+            if request_id is not None
+            else None
+        )
+        normalized_question_id = (
+            _validate_identifier(question_id, "题目标识")
+            if question_id is not None
+            else None
+        )
+        normalized_content_version = (
+            _validate_identifier(content_version, "内容版本")
+            if content_version is not None
+            else None
+        )
+        normalized_new_content_version = (
+            _validate_identifier(new_content_version, "新内容版本")
+            if new_content_version is not None
+            else None
+        )
+        if not 1 <= limit <= 100:
+            raise ValueError("审计查询数量必须介于 1 到 100")
+
+        filters: list[str] = []
+        parameters: list[object] = []
+        if normalized_request_id is not None:
+            filters.append("request.request_id = ?")
+            parameters.append(normalized_request_id)
+        if normalized_question_id is not None:
+            filters.append("request.question_id = ?")
+            parameters.append(normalized_question_id)
+        if normalized_content_version is not None:
+            filters.append("request.content_version = ?")
+            parameters.append(normalized_content_version)
+        if normalized_new_content_version is not None:
+            filters.append(
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM practice_correction_republications AS republication
+                    WHERE republication.request_id = request.request_id
+                      AND republication.new_content_version = ?
+                )
+                """
+            )
+            parameters.append(normalized_new_content_version)
+        if linked is not None:
+            link_predicate = "EXISTS" if linked else "NOT EXISTS"
+            filters.append(
+                f"""
+                {link_predicate} (
+                    SELECT 1
+                    FROM practice_correction_republications AS republication
+                    WHERE republication.request_id = request.request_id
+                )
+                """
+            )
+        where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+        parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {_PRACTICE_CORRECTION_REQUEST_COLUMNS}
+                FROM practice_correction_requests AS request
+                {where_clause}
+                ORDER BY request.created_at ASC, request.request_id ASC
+                LIMIT ?
+                """,
+                tuple(parameters),
+            ).fetchall()
+        requests = tuple(_practice_correction_request_from_row(row) for row in rows)
+        republications = self._republications_by_request_id(
+            request.request_id for request in requests
+        )
+        events = self._events_by_request_id(request.request_id for request in requests)
+        return tuple(
+            PracticeCorrectionAudit(
+                request=request,
+                republication=republications.get(request.request_id),
+                events=events.get(request.request_id, ()),
+            )
+            for request in requests
+        )
+
     def resolve_practice_correction_request(
         self,
         resolution: PracticeCorrectionResolutionInput,
@@ -793,6 +918,34 @@ class LearningProfileStore:
             for row in rows
         }
 
+    def _events_by_request_id(
+        self,
+        request_ids: Iterable[str],
+    ) -> dict[str, tuple[PracticeCorrectionEvent, ...]]:
+        normalized_request_ids = tuple(request_ids)
+        if not normalized_request_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in normalized_request_ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT event_id, request_id, actor_id, event_type, status, notes,
+                       created_at
+                FROM practice_correction_events
+                WHERE request_id IN ({placeholders})
+                ORDER BY request_id ASC, created_at ASC, rowid ASC
+                """,
+                normalized_request_ids,
+            ).fetchall()
+        events_by_request_id: dict[str, list[PracticeCorrectionEvent]] = {}
+        for row in rows:
+            event = _practice_correction_event_from_row(row)
+            events_by_request_id.setdefault(event.request_id, []).append(event)
+        return {
+            request_id: tuple(events)
+            for request_id, events in events_by_request_id.items()
+        }
+
     def _records_for_user(self, user_id: str) -> tuple[LearningRecord, ...]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -996,6 +1149,18 @@ def _practice_correction_republication_from_row(
         new_content_hash=row["new_content_hash"],
         linked_by=row["linked_by"],
         linked_at=row["linked_at"],
+    )
+
+
+def _practice_correction_event_from_row(row: sqlite3.Row) -> PracticeCorrectionEvent:
+    return PracticeCorrectionEvent(
+        event_id=row["event_id"],
+        request_id=row["request_id"],
+        actor_id=row["actor_id"],
+        event_type=row["event_type"],
+        status=PracticeCorrectionRequestStatus(row["status"]),
+        notes=row["notes"],
+        created_at=row["created_at"],
     )
 
 

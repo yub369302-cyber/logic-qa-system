@@ -1099,6 +1099,129 @@ def test_correction_republication_link_requires_published_active_version(
     assert "republished_content_version" not in restored_outcomes.json()[0]
 
 
+def test_admin_correction_audit_routes_return_link_and_complete_event_chain(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """管理员可按申请或新版本回查关联和事件链，学习者不能读取治理审计。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    first_payload = _publish_payload("q-1", "content-v1")
+    _prepare_and_approve(client, first_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=first_payload,
+    ).status_code == 200
+    attempt = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "A"},
+    )
+    assert attempt.status_code == 200
+    correction_request = client.post(
+        "/v1/learning/practice-correction-requests",
+        headers=_LEARNER_HEADERS,
+        json={"record_id": attempt.json()["record_id"], "reason": "请复核题目版本"},
+    )
+    assert correction_request.status_code == 200
+    request_id = correction_request.json()["request_id"]
+    assert client.post(
+        f"/v1/admin/practice-correction-requests/{request_id}/resolution",
+        headers=_ADMIN_HEADERS,
+        json={"resolution": "republication_required", "notes": "进入重发布流程"},
+    ).status_code == 200
+    second_payload = {
+        **_publish_payload("q-1", "content-v2"),
+        "stem": "q-1 的审计查询新版题干",
+    }
+    candidate = _prepare_and_approve(client, second_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=second_payload,
+    ).status_code == 200
+    assert client.post(
+        "/v1/admin/questions/q-1/content-v2/correction-republication-links",
+        headers=_ADMIN_HEADERS,
+        json={"request_id": request_id, "previous_content_version": "content-v1"},
+    ).status_code == 200
+
+    unauthenticated = client.get("/v1/admin/practice-correction-audits")
+    learner = client.get(
+        "/v1/admin/practice-correction-audits",
+        headers=_LEARNER_HEADERS,
+    )
+    exact = client.get(
+        f"/v1/admin/practice-correction-audits/{request_id}",
+        headers=_ADMIN_HEADERS,
+    )
+    by_new_version = client.get(
+        "/v1/admin/practice-correction-audits?new_content_version=content-v2",
+        headers=_ADMIN_HEADERS,
+    )
+    linked_only = client.get(
+        "/v1/admin/practice-correction-audits?linked=true",
+        headers=_ADMIN_HEADERS,
+    )
+    unlinked_only = client.get(
+        "/v1/admin/practice-correction-audits?linked=false",
+        headers=_ADMIN_HEADERS,
+    )
+    malformed_filter = client.get(
+        "/v1/admin/practice-correction-audits?question_id=%20",
+        headers=_ADMIN_HEADERS,
+    )
+    missing = client.get(
+        "/v1/admin/practice-correction-audits/missing-request",
+        headers=_ADMIN_HEADERS,
+    )
+    profile = client.get("/v1/learning/profile", headers=_LEARNER_HEADERS)
+
+    assert unauthenticated.status_code == 401
+    assert learner.status_code == 403
+    assert exact.status_code == 200
+    payload = exact.json()
+    assert payload["request"]["request_id"] == request_id
+    assert payload["request"]["reason"] == "请复核题目版本"
+    assert payload["request"]["resolution_notes"] == "进入重发布流程"
+    assert payload["republication"] == {
+        "request_id": request_id,
+        "question_id": "q-1",
+        "previous_content_version": "content-v1",
+        "new_content_version": "content-v2",
+        "new_content_hash": candidate["content_hash"],
+        "linked_by": "admin-a",
+        "linked_at": payload["republication"]["linked_at"],
+    }
+    assert [event["event_type"] for event in payload["events"]] == [
+        "requested",
+        "resolved",
+        "republication_linked",
+    ]
+    assert [event["actor_id"] for event in payload["events"]] == [
+        "user-a",
+        "admin-a",
+        "admin-a",
+    ]
+    assert [event["notes"] for event in payload["events"]] == [
+        "请复核题目版本",
+        "进入重发布流程",
+        "content-v2",
+    ]
+    assert by_new_version.status_code == 200
+    assert by_new_version.json() == [payload]
+    assert linked_only.status_code == 200
+    assert linked_only.json() == [payload]
+    assert unlinked_only.status_code == 200
+    assert unlinked_only.json() == []
+    assert malformed_filter.status_code == 422
+    assert malformed_filter.json()["detail"] == "题目标识不能为空"
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == "未找到复核申请审计"
+    assert profile.json()["total_attempts"] == 1
+    assert profile.json()["correct_attempts"] == 0
+
+
 def test_correction_republication_link_rejects_non_republication_or_mismatched_request(
     tmp_path: Path,
     monkeypatch,
