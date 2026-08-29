@@ -132,6 +132,9 @@ def test_question_bank_routes_are_registered_once() -> None:
         "/v1/admin/question-reviews",
         "/v1/admin/question-reviews/{question_id}/{content_version}/{content_hash}",
         "/v1/admin/questions",
+        "/v1/admin/questions/{question_id}/{content_version}/deactivation",
+        "/v1/admin/questions/{question_id}/{content_version}/reactivation",
+        "/v1/admin/questions/{question_id}/version-lifecycle-events",
         "/v1/admin/questions/{question_id}/{content_version}/correction-republication-links",
     }
     assert expected_paths <= registered_paths
@@ -562,6 +565,230 @@ def test_candidate_snapshot_is_idempotent_and_retrievable(
     assert first == second
     assert fetched.status_code == 200
     assert fetched.json() == first
+
+
+def test_admin_version_lifecycle_routes_preserve_immutable_practice_ledger(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """管理员可受控下线与回滚，学习者不能调用且首次练习记录保持不变。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    first_payload = _publish_payload("q-1", "content-v1")
+    second_payload = {
+        **_publish_payload("q-1", "content-v2"),
+        "stem": "q-1 的受控下线新版题干",
+    }
+    first_candidate = _prepare_and_approve(client, first_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=first_payload,
+    ).status_code == 200
+    initial_attempt = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "A"},
+    )
+    assert initial_attempt.status_code == 200
+    second_candidate = _prepare_and_approve(client, second_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=second_payload,
+    ).status_code == 200
+
+    deactivation_path = "/v1/admin/questions/q-1/content-v2/deactivation"
+    reactivation_path = "/v1/admin/questions/q-1/content-v1/reactivation"
+    events_path = "/v1/admin/questions/q-1/version-lifecycle-events"
+    unauthenticated = client.post(
+        deactivation_path,
+        json={"reason": "等待复核"},
+    )
+    learner = client.post(
+        deactivation_path,
+        headers=_LEARNER_HEADERS,
+        json={"reason": "等待复核"},
+    )
+    malformed = client.post(
+        deactivation_path,
+        headers=_ADMIN_HEADERS,
+        json={"reason": "等待复核", "actor_id": "forged-admin"},
+    )
+    deactivated = client.post(
+        deactivation_path,
+        headers=_ADMIN_HEADERS,
+        json={"reason": "新版题干待核验，受控下线"},
+    )
+    duplicate_deactivation = client.post(
+        deactivation_path,
+        headers=_ADMIN_HEADERS,
+        json={"reason": "重复下线"},
+    )
+    unavailable_question = client.get(
+        "/v1/learning/questions/q-1/content-v2",
+        headers=_LEARNER_HEADERS,
+    )
+    events_after_deactivation = client.get(events_path, headers=_ADMIN_HEADERS)
+    learner_events = client.get(events_path, headers=_LEARNER_HEADERS)
+
+    assert unauthenticated.status_code == 401
+    assert learner.status_code == 403
+    assert malformed.status_code == 422
+    assert deactivated.status_code == 200
+    assert deactivated.json() == {
+        "event_id": deactivated.json()["event_id"],
+        "question_id": "q-1",
+        "content_version": "content-v2",
+        "content_hash": second_candidate["content_hash"],
+        "action": "deactivated",
+        "actor_id": "admin-a",
+        "replaced_content_version": None,
+        "reason": "新版题干待核验，受控下线",
+        "created_at": deactivated.json()["created_at"],
+    }
+    assert duplicate_deactivation.status_code == 422
+    assert duplicate_deactivation.json()["detail"] == "该题目版本当前未活动，不能下线"
+    assert unavailable_question.status_code == 404
+    assert learner_events.status_code == 403
+    assert events_after_deactivation.status_code == 200
+    assert events_after_deactivation.json() == [deactivated.json()]
+
+    reactivated = client.post(
+        reactivation_path,
+        headers=_ADMIN_HEADERS,
+        json={"reason": "审核与确定性复验均通过，回滚历史版本"},
+    )
+    restored_question = client.get(
+        "/v1/learning/questions/q-1/content-v1",
+        headers=_LEARNER_HEADERS,
+    )
+    repeat_attempt = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "B"},
+    )
+    profile = client.get("/v1/learning/profile", headers=_LEARNER_HEADERS)
+    events = client.get(events_path, headers=_ADMIN_HEADERS)
+
+    assert reactivated.status_code == 200
+    assert reactivated.json() == {
+        "event_id": reactivated.json()["event_id"],
+        "question_id": "q-1",
+        "content_version": "content-v1",
+        "content_hash": first_candidate["content_hash"],
+        "action": "reactivated",
+        "actor_id": "admin-a",
+        "replaced_content_version": None,
+        "reason": "审核与确定性复验均通过，回滚历史版本",
+        "created_at": reactivated.json()["created_at"],
+    }
+    assert restored_question.status_code == 200
+    assert restored_question.json()["content_version"] == "content-v1"
+    assert repeat_attempt.status_code == 409
+    assert profile.status_code == 200
+    assert profile.json()["total_attempts"] == 1
+    assert profile.json()["correct_attempts"] == 0
+    assert events.status_code == 200
+    assert events.json() == [deactivated.json(), reactivated.json()]
+
+    stale_review = client.post(
+        "/v1/admin/question-reviews",
+        headers=_ADMIN_HEADERS,
+        json={
+            "question_id": "q-1",
+            "content_version": "content-v2",
+            "content_hash": second_candidate["content_hash"],
+            "status": "needs_revision",
+            "verified_answer": None,
+            "formalization_version": "logic-v1",
+            "notes": "历史版本审核已撤销",
+        },
+    )
+    rejected_reactivation = client.post(
+        "/v1/admin/questions/q-1/content-v2/reactivation",
+        headers=_ADMIN_HEADERS,
+        json={"reason": "尝试绕过历史审核"},
+    )
+
+    assert stale_review.status_code == 200
+    assert rejected_reactivation.status_code == 422
+    assert rejected_reactivation.json()["detail"] == "题目当前内容未通过审核，不能发布"
+    assert client.get(
+        "/v1/learning/questions/q-1/content-v1",
+        headers=_LEARNER_HEADERS,
+    ).status_code == 200
+
+
+def test_republication_outcome_downgrades_when_linked_version_is_deactivated(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """已关联版本下线后，学习者结果必须安全降级而不能继续声称已发布。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    first_payload = _publish_payload("q-1", "content-v1")
+    _prepare_and_approve(client, first_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=first_payload,
+    ).status_code == 200
+    attempt = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "A"},
+    )
+    assert attempt.status_code == 200
+    correction_request = client.post(
+        "/v1/learning/practice-correction-requests",
+        headers=_LEARNER_HEADERS,
+        json={"record_id": attempt.json()["record_id"], "reason": "需要重发布"},
+    )
+    assert correction_request.status_code == 200
+    request_id = correction_request.json()["request_id"]
+    assert client.post(
+        f"/v1/admin/practice-correction-requests/{request_id}/resolution",
+        headers=_ADMIN_HEADERS,
+        json={"resolution": "republication_required"},
+    ).status_code == 200
+    second_payload = {
+        **_publish_payload("q-1", "content-v2"),
+        "stem": "q-1 的关联新版题干",
+    }
+    _prepare_and_approve(client, second_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=second_payload,
+    ).status_code == 200
+    assert client.post(
+        "/v1/admin/questions/q-1/content-v2/correction-republication-links",
+        headers=_ADMIN_HEADERS,
+        json={"request_id": request_id, "previous_content_version": "content-v1"},
+    ).status_code == 200
+
+    published_outcome = client.get(
+        "/v1/learning/practice-correction-outcomes",
+        headers=_LEARNER_HEADERS,
+    )
+    deactivated = client.post(
+        "/v1/admin/questions/q-1/content-v2/deactivation",
+        headers=_ADMIN_HEADERS,
+        json={"reason": "关联新版本需要暂时下线"},
+    )
+    downgraded_outcome = client.get(
+        "/v1/learning/practice-correction-outcomes",
+        headers=_LEARNER_HEADERS,
+    )
+
+    assert published_outcome.status_code == 200
+    assert published_outcome.json()[0]["republished_content_version"] == "content-v2"
+    assert deactivated.status_code == 200
+    assert downgraded_outcome.status_code == 200
+    assert downgraded_outcome.json()[0]["message"] == (
+        "复核已完成，该题目将按发布流程复核；若发布新版本，"
+        "新版本会作为独立练习重新推荐。"
+    )
+    assert "republished_content_version" not in downgraded_outcome.json()[0]
 
 
 def test_active_practice_question_requires_identity_and_hides_internal_fields(
