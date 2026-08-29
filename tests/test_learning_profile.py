@@ -12,6 +12,7 @@ from logic_qa.learning_profile import (
     ImmutablePracticeAttemptError,
     LearningProfileStore,
     LearningRecordInput,
+    PracticeCorrectionOutcomeKind,
     PracticeCorrectionRequestAlreadyResolvedError,
     PracticeCorrectionRequestInput,
     PracticeCorrectionResolution,
@@ -472,6 +473,102 @@ def test_practice_correction_request_preserves_attempt_ledger_and_audit_history(
         ("requested", "pending"),
         ("resolved", "republication_required"),
     ]
+
+
+def test_practice_correction_outcomes_are_safe_derived_views(tmp_path: Path) -> None:
+    """派生处置视图只由申请状态生成，不能回写账本或暴露治理内部信息。"""
+    store = _store(tmp_path)
+    record = store.record_practice_attempt(
+        LearningRecordInput(
+            user_id="user-a",
+            question_id="q-1",
+            content_version="content-v1",
+            question_type="propositional",
+            is_correct=False,
+        )
+    )
+    requested = store.create_practice_correction_request(
+        PracticeCorrectionRequestInput(
+            user_id="user-a",
+            record_id=record.record_id,
+            reason="请复核判分依据",
+        )
+    )
+    assert requested is not None
+
+    pending = store.list_practice_correction_outcomes_for_user("user-a")
+
+    assert len(pending) == 1
+    assert pending[0].kind is PracticeCorrectionOutcomeKind.PENDING
+    assert pending[0].message == "复核申请已提交，正在处理中。"
+    assert store.get_profile("user-a").correct_attempts == 0
+    assert store.attempted_practice_versions("user-a") == (("q-1", "content-v1"),)
+
+    resolved = store.resolve_practice_correction_request(
+        PracticeCorrectionResolutionInput(
+            request_id=requested.request_id,
+            resolver_id="admin-a",
+            resolution=PracticeCorrectionResolution.REPUBLICATION_REQUIRED,
+            notes="需要更新形式化资产并重新发布。",
+        )
+    )
+    assert resolved is not None
+
+    outcomes = store.list_practice_correction_outcomes_for_user("user-a")
+
+    assert len(outcomes) == 1
+    assert outcomes[0].kind is PracticeCorrectionOutcomeKind.REPUBLICATION_REQUIRED
+    assert outcomes[0].message == (
+        "复核已完成，该题目将按发布流程复核；若发布新版本，"
+        "新版本会作为独立练习重新推荐。"
+    )
+    assert outcomes[0].resolved_at == resolved.resolved_at
+    assert not hasattr(outcomes[0], "reason")
+    assert not hasattr(outcomes[0], "resolved_by")
+    assert not hasattr(outcomes[0], "resolution_notes")
+    assert store.get_profile("user-a").total_attempts == 1
+    assert store.get_profile("user-a").correct_attempts == 0
+    assert store.attempted_practice_versions("user-a") == (("q-1", "content-v1"),)
+    assert store.list_practice_correction_outcomes_for_user("user-b") == ()
+
+
+def test_record_confirmed_outcome_preserves_original_attempt(tmp_path: Path) -> None:
+    """确认原记录的派生视图不能将管理员结论误表述为改分或重新作答。"""
+    store = _store(tmp_path)
+    record = store.record_practice_attempt(
+        LearningRecordInput(
+            user_id="user-a",
+            question_id="q-1",
+            content_version="content-v1",
+            question_type="propositional",
+            is_correct=False,
+        )
+    )
+    requested = store.create_practice_correction_request(
+        PracticeCorrectionRequestInput(
+            user_id="user-a",
+            record_id=record.record_id,
+            reason="请确认判分记录",
+        )
+    )
+    assert requested is not None
+    resolved = store.resolve_practice_correction_request(
+        PracticeCorrectionResolutionInput(
+            request_id=requested.request_id,
+            resolver_id="admin-a",
+            resolution=PracticeCorrectionResolution.RECORD_CONFIRMED,
+        )
+    )
+    assert resolved is not None
+
+    outcomes = store.list_practice_correction_outcomes_for_user("user-a")
+
+    assert outcomes[0].kind is PracticeCorrectionOutcomeKind.RECORD_CONFIRMED
+    assert outcomes[0].message == "复核已完成，当前练习记录已确认。"
+    assert outcomes[0].resolved_at == resolved.resolved_at
+    assert store.get_profile("user-a").total_attempts == 1
+    assert store.get_profile("user-a").correct_attempts == 0
+    assert store.attempted_practice_versions("user-a") == (("q-1", "content-v1"),)
 
 
 def test_learning_store_upgrades_v2_ledger_to_correction_request_schema(

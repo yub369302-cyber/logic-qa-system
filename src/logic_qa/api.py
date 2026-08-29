@@ -46,6 +46,8 @@ from logic_qa.learning_profile import (
     LearningProfileStore,
     LearningRecord,
     LearningRecordInput,
+    PracticeCorrectionOutcome,
+    PracticeCorrectionOutcomeKind,
     PracticeCorrectionRequest,
     PracticeCorrectionRequestAlreadyResolvedError,
     PracticeCorrectionRequestInput,
@@ -530,6 +532,19 @@ class AdminPracticeCorrectionRequestResponse(BaseModel):
     resolved_at: str | None
 
 
+class PracticeCorrectionOutcomeResponse(BaseModel):
+    """学习者可见的派生复核结果，不包含管理员与题库内部信息。"""
+
+    request_id: str
+    record_id: str
+    question_id: str
+    content_version: str
+    kind: PracticeCorrectionOutcomeKind
+    message: str
+    created_at: str
+    resolved_at: str | None
+
+
 class LearningRecordResponse(BaseModel):
     """当前认证用户已持久化的最小学习记录确认。"""
 
@@ -977,6 +992,23 @@ def get_practice_correction_requests(
 
 
 @app.get(
+    "/v1/learning/practice-correction-outcomes",
+    response_model=list[PracticeCorrectionOutcomeResponse],
+)
+def get_practice_correction_outcomes(
+    identity: CurrentIdentity,
+) -> list[PracticeCorrectionOutcomeResponse]:
+    """读取当前学习者的安全派生处置视图，不改变历史练习结果。"""
+    try:
+        outcomes = learning_store.list_practice_correction_outcomes_for_user(
+            identity.subject
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return [_practice_correction_outcome_to_response(item) for item in outcomes]
+
+
+@app.get(
     "/v1/admin/practice-correction-requests",
     response_model=list[AdminPracticeCorrectionRequestResponse],
 )
@@ -1238,6 +1270,22 @@ def _admin_practice_correction_request_to_response(
         resolved_by=request.resolved_by,
         resolution_notes=request.resolution_notes,
         resolved_at=request.resolved_at,
+    )
+
+
+def _practice_correction_outcome_to_response(
+    outcome: PracticeCorrectionOutcome,
+) -> PracticeCorrectionOutcomeResponse:
+    """转换安全派生处置视图，不返回申请理由或管理员内部信息。"""
+    return PracticeCorrectionOutcomeResponse(
+        request_id=outcome.request_id,
+        record_id=outcome.record_id,
+        question_id=outcome.question_id,
+        content_version=outcome.content_version,
+        kind=outcome.kind,
+        message=outcome.message,
+        created_at=outcome.created_at,
+        resolved_at=outcome.resolved_at,
     )
 
 

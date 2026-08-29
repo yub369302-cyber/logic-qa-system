@@ -858,6 +858,105 @@ def test_practice_correction_request_is_isolated_and_resolved_without_rewriting_
     assert "resolution_notes" not in resolved_learner_list.json()[0]
 
 
+def test_republication_outcome_projects_safely_and_new_version_is_recommended(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """派生结果说明复核状态，新发布版本仍通过版本化推荐独立进入练习。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    first_payload = _publish_payload("q-1", "content-v1")
+    _prepare_and_approve(client, first_payload)
+    first_published = client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=first_payload,
+    )
+    assert first_published.status_code == 200
+    attempt = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "A"},
+    )
+    assert attempt.status_code == 200
+    request = client.post(
+        "/v1/learning/practice-correction-requests",
+        headers=_LEARNER_HEADERS,
+        json={"record_id": attempt.json()["record_id"], "reason": "请复核题目版本"},
+    )
+    assert request.status_code == 200
+    resolved = client.post(
+        f"/v1/admin/practice-correction-requests/{request.json()['request_id']}/resolution",
+        headers=_ADMIN_HEADERS,
+        json={
+            "resolution": "republication_required",
+            "notes": "题库复核中，内部说明不对学习者公开。",
+        },
+    )
+    assert resolved.status_code == 200
+
+    unauthenticated = client.get("/v1/learning/practice-correction-outcomes")
+    other_user = client.get(
+        "/v1/learning/practice-correction-outcomes",
+        headers={**_LEARNER_HEADERS, "X-Logic-QA-Subject": "user-b"},
+    )
+    outcomes = client.get(
+        "/v1/learning/practice-correction-outcomes",
+        headers=_LEARNER_HEADERS,
+    )
+
+    assert unauthenticated.status_code == 401
+    assert other_user.status_code == 200
+    assert other_user.json() == []
+    assert outcomes.status_code == 200
+    assert outcomes.json() == [
+        {
+            "request_id": request.json()["request_id"],
+            "record_id": attempt.json()["record_id"],
+            "question_id": "q-1",
+            "content_version": "content-v1",
+            "kind": "republication_required",
+            "message": (
+                "复核已完成，该题目将按发布流程复核；若发布新版本，"
+                "新版本会作为独立练习重新推荐。"
+            ),
+            "created_at": outcomes.json()[0]["created_at"],
+            "resolved_at": resolved.json()["resolved_at"],
+        }
+    ]
+    for forbidden_field in (
+        "reason",
+        "resolved_by",
+        "resolution_notes",
+        "is_correct",
+        "content_hash",
+        "formalization",
+    ):
+        assert forbidden_field not in outcomes.json()[0]
+
+    second_payload = {
+        **_publish_payload("q-1", "content-v2"),
+        "stem": "q-1 的复核后新版题干",
+    }
+    _prepare_and_approve(client, second_payload)
+    second_published = client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=second_payload,
+    )
+    recommendations = client.get(
+        "/v1/learning/recommendations",
+        headers=_LEARNER_HEADERS,
+    )
+    profile = client.get("/v1/learning/profile", headers=_LEARNER_HEADERS)
+
+    assert second_published.status_code == 200
+    assert recommendations.status_code == 200
+    assert recommendations.json()[0]["question"]["question_id"] == "q-1"
+    assert recommendations.json()[0]["question"]["content_version"] == "content-v2"
+    assert profile.json()["total_attempts"] == 1
+    assert profile.json()["correct_attempts"] == 0
+
+
 def test_practice_attempt_record_cannot_be_deleted_by_its_owner(
     tmp_path: Path,
     monkeypatch,
