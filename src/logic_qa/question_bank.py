@@ -526,12 +526,37 @@ class QuestionBankStore:
             ).fetchall()
         return tuple(_question_from_row(row) for row in rows)
 
-    def get_active_learner_question(
+    def get_published_question(
         self,
         question_id: str,
         content_version: str,
-    ) -> LearnerQuestion | None:
-        """按题号和版本读取活动题目的最小学习者视图。"""
+    ) -> PublishedQuestion | None:
+        """精确读取已发布版本，供跨存储投影核验历史发布事实。"""
+        normalized_question_id = _validate_text(question_id, "题目标识", max_length=128)
+        normalized_content_version = _validate_text(
+            content_version,
+            "内容版本",
+            max_length=128,
+        )
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT question_id, content_version, content_hash, question_type, stem,
+                       options, error_tags, knowledge_tags, formalization_version,
+                       formalization, published_at
+                FROM question_versions
+                WHERE question_id = ? AND content_version = ?
+                """,
+                (normalized_question_id, normalized_content_version),
+            ).fetchone()
+        return _question_from_row(row) if row else None
+
+    def get_active_published_question(
+        self,
+        question_id: str,
+        content_version: str,
+    ) -> PublishedQuestion | None:
+        """精确读取当前活动发布版本，供受控治理链路核验新关联资格。"""
         normalized_question_id = _validate_text(question_id, "题目标识", max_length=128)
         normalized_content_version = _validate_text(
             content_version,
@@ -549,7 +574,16 @@ class QuestionBankStore:
                 """,
                 (normalized_question_id, normalized_content_version),
             ).fetchone()
-        return _learner_question_from(_question_from_row(row)) if row else None
+        return _question_from_row(row) if row else None
+
+    def get_active_learner_question(
+        self,
+        question_id: str,
+        content_version: str,
+    ) -> LearnerQuestion | None:
+        """按题号和版本读取活动题目的最小学习者视图。"""
+        question = self.get_active_published_question(question_id, content_version)
+        return _learner_question_from(question) if question else None
 
     def grade_active_learner_answer(
         self,
