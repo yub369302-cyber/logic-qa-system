@@ -40,6 +40,7 @@ from logic_qa.grouping_matching_solver import (
 )
 from logic_qa.learning_profile import (
     DuplicatePracticeAttemptError,
+    ImmutablePracticeAttemptError,
     LearningProfile,
     LearningProfileStore,
     LearningRecord,
@@ -887,6 +888,8 @@ def delete_learning_record(
             user_id=identity.subject,
             record_id=record_id,
         )
+    except ImmutablePracticeAttemptError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     if not deleted:
