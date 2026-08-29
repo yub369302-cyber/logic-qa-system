@@ -46,6 +46,8 @@ from logic_qa.learning_profile import (
     LearningProfileStore,
     LearningRecord,
     LearningRecordInput,
+    PracticeCorrectionAudit,
+    PracticeCorrectionEvent,
     PracticeCorrectionOutcome,
     PracticeCorrectionOutcomeKind,
     PracticeCorrectionRequest,
@@ -531,6 +533,38 @@ class AdminPracticeCorrectionRequestResponse(BaseModel):
     resolved_by: str | None
     resolution_notes: str | None
     resolved_at: str | None
+
+
+class AdminPracticeCorrectionRepublicationResponse(BaseModel):
+    """管理员审计视图中的不可变重发布关联。"""
+
+    request_id: str
+    question_id: str
+    previous_content_version: str
+    new_content_version: str
+    new_content_hash: str
+    linked_by: str
+    linked_at: str
+
+
+class AdminPracticeCorrectionEventResponse(BaseModel):
+    """管理员审计视图中的一条追加式申请事件。"""
+
+    event_id: str
+    request_id: str
+    actor_id: str
+    event_type: str
+    status: PracticeCorrectionRequestStatus
+    notes: str | None
+    created_at: str
+
+
+class AdminPracticeCorrectionAuditResponse(BaseModel):
+    """一条申请的完整管理员治理审计视图。"""
+
+    request: AdminPracticeCorrectionRequestResponse
+    republication: AdminPracticeCorrectionRepublicationResponse | None
+    events: list[AdminPracticeCorrectionEventResponse]
 
 
 class PracticeCorrectionOutcomeResponse(BaseModel):
@@ -1050,6 +1084,52 @@ def get_admin_practice_correction_requests(
     return [_admin_practice_correction_request_to_response(item) for item in requests]
 
 
+@app.get(
+    "/v1/admin/practice-correction-audits",
+    response_model=list[AdminPracticeCorrectionAuditResponse],
+)
+def list_admin_practice_correction_audits(
+    _: AdminIdentity,
+    request_id: str | None = None,
+    question_id: str | None = None,
+    content_version: str | None = None,
+    new_content_version: str | None = None,
+    linked: bool | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+) -> list[AdminPracticeCorrectionAuditResponse]:
+    """按申请、题目或版本只读回查更正申请的关联和完整审计事件链。"""
+    try:
+        audits = learning_store.list_practice_correction_audits(
+            request_id=request_id,
+            question_id=question_id,
+            content_version=content_version,
+            new_content_version=new_content_version,
+            linked=linked,
+            limit=limit,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return [_practice_correction_audit_to_response(item) for item in audits]
+
+
+@app.get(
+    "/v1/admin/practice-correction-audits/{request_id}",
+    response_model=AdminPracticeCorrectionAuditResponse,
+)
+def get_admin_practice_correction_audit(
+    request_id: str,
+    _: AdminIdentity,
+) -> AdminPracticeCorrectionAuditResponse:
+    """精确回查一条申请的不可变关联和完整事件链。"""
+    try:
+        audit = learning_store.get_practice_correction_audit(request_id)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if audit is None:
+        raise HTTPException(status_code=404, detail="未找到复核申请审计")
+    return _practice_correction_audit_to_response(audit)
+
+
 @app.post(
     "/v1/admin/practice-correction-requests/{request_id}/resolution",
     response_model=AdminPracticeCorrectionRequestResponse,
@@ -1299,6 +1379,47 @@ def _admin_practice_correction_request_to_response(
         resolved_by=request.resolved_by,
         resolution_notes=request.resolution_notes,
         resolved_at=request.resolved_at,
+    )
+
+
+def _practice_correction_audit_to_response(
+    audit: PracticeCorrectionAudit,
+) -> AdminPracticeCorrectionAuditResponse:
+    """将不可变关联与事件链转换为管理员专用审计响应。"""
+    republication = audit.republication
+    return AdminPracticeCorrectionAuditResponse(
+        request=_admin_practice_correction_request_to_response(audit.request),
+        republication=(
+            AdminPracticeCorrectionRepublicationResponse(
+                request_id=republication.request_id,
+                question_id=republication.question_id,
+                previous_content_version=republication.previous_content_version,
+                new_content_version=republication.new_content_version,
+                new_content_hash=republication.new_content_hash,
+                linked_by=republication.linked_by,
+                linked_at=republication.linked_at,
+            )
+            if republication is not None
+            else None
+        ),
+        events=[
+            _practice_correction_event_to_response(event) for event in audit.events
+        ],
+    )
+
+
+def _practice_correction_event_to_response(
+    event: PracticeCorrectionEvent,
+) -> AdminPracticeCorrectionEventResponse:
+    """将追加式领域审计事件转换为管理员响应。"""
+    return AdminPracticeCorrectionEventResponse(
+        event_id=event.event_id,
+        request_id=event.request_id,
+        actor_id=event.actor_id,
+        event_type=event.event_type,
+        status=event.status,
+        notes=event.notes,
+        created_at=event.created_at,
     )
 
 
