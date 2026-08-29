@@ -7,6 +7,8 @@ from pathlib import Path
 from time import perf_counter
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from logic_qa.api_security import AdminIdentity, CurrentIdentity
@@ -89,6 +91,8 @@ app = FastAPI(
         "自然语言解析将在下一阶段接入。"
     ),
 )
+static_directory = Path(__file__).resolve().parent / "static"
+app.mount("/assets", StaticFiles(directory=static_directory), name="assets")
 engine = InferenceEngine()
 choice_verifier = ChoiceVerifier()
 chinese_parser = ControlledChineseParser()
@@ -526,6 +530,12 @@ async def collect_runtime_metrics(request: Request, call_next):
         latency_ms=(perf_counter() - started_at) * 1000,
     )
     return response
+
+
+@app.get("/")
+def learner_home() -> FileResponse:
+    """返回匿名学习者可使用的同源逻辑验证页面。"""
+    return FileResponse(static_directory / "index.html")
 
 
 @app.get("/health")
