@@ -248,6 +248,16 @@ class PracticeRecommendation:
     reason: str
 
 
+@dataclass(frozen=True, slots=True)
+class GradedPracticeAttempt:
+    """服务端判分后的学习记录输入，内部标签不应返回给学习者。"""
+
+    question: LearnerQuestion
+    is_correct: bool
+    error_tags: tuple[str, ...]
+    knowledge_tags: tuple[str, ...]
+
+
 class QuestionBankStore:
     """保存不可变题目版本，只发布与审核内容精确匹配的候选。"""
 
@@ -515,6 +525,83 @@ class QuestionBankStore:
                 """
             ).fetchall()
         return tuple(_question_from_row(row) for row in rows)
+
+    def get_active_learner_question(
+        self,
+        question_id: str,
+        content_version: str,
+    ) -> LearnerQuestion | None:
+        """按题号和版本读取活动题目的最小学习者视图。"""
+        normalized_question_id = _validate_text(question_id, "题目标识", max_length=128)
+        normalized_content_version = _validate_text(
+            content_version,
+            "内容版本",
+            max_length=128,
+        )
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT question_id, content_version, content_hash, question_type, stem,
+                       options, error_tags, knowledge_tags, formalization_version,
+                       formalization, published_at
+                FROM question_versions
+                WHERE question_id = ? AND content_version = ? AND is_active = 1
+                """,
+                (normalized_question_id, normalized_content_version),
+            ).fetchone()
+        return _learner_question_from(_question_from_row(row)) if row else None
+
+    def grade_active_learner_answer(
+        self,
+        question_id: str,
+        content_version: str,
+        selected_option: str,
+    ) -> GradedPracticeAttempt | None:
+        """使用活动发布版本的已审计正确选项进行服务端判分。"""
+        normalized_question_id = _validate_text(question_id, "题目标识", max_length=128)
+        normalized_content_version = _validate_text(
+            content_version,
+            "内容版本",
+            max_length=128,
+        )
+        normalized_selected_option = _validate_text(
+            selected_option,
+            "所选选项",
+            max_length=_MAX_OPTION_LENGTH,
+        )
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT version.question_id, version.content_version,
+                       version.content_hash, version.question_type, version.stem,
+                       version.options, version.error_tags, version.knowledge_tags,
+                       version.formalization_version, version.formalization,
+                       version.published_at, verification.selected_option
+                FROM question_versions AS version
+                INNER JOIN question_formalization_verification_events AS verification
+                    ON verification.question_id = version.question_id
+                    AND verification.content_version = version.content_version
+                    AND verification.content_hash = version.content_hash
+                WHERE version.question_id = ?
+                    AND version.content_version = ?
+                    AND version.is_active = 1
+                ORDER BY verification.created_at DESC, verification.event_id DESC
+                LIMIT 1
+                """,
+                (normalized_question_id, normalized_content_version),
+            ).fetchone()
+        if row is None:
+            return None
+        question = _question_from_row(row)
+        learner_question = _learner_question_from(question)
+        if normalized_selected_option not in learner_question.options:
+            raise ValueError("所选选项不属于该题目")
+        return GradedPracticeAttempt(
+            question=learner_question,
+            is_correct=normalized_selected_option == row["selected_option"],
+            error_tags=question.error_tags,
+            knowledge_tags=question.knowledge_tags,
+        )
 
     def get_formalization_verification(
         self,

@@ -297,6 +297,15 @@ class LearningRecordCreateRequest(BaseModel):
     duration_seconds: int | None = None
 
 
+class PracticeAnswerRequest(BaseModel):
+    """认证学习者对已发布题目提交的选项答案。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    selected_option: str = Field(description="用户选择的题目选项原文")
+    duration_seconds: int | None = Field(default=None, ge=0)
+
+
 class ReasoningStepInput(BaseModel):
     """用户提交的一步结构化命题逻辑推理。"""
 
@@ -456,6 +465,16 @@ class PracticeRecommendationResponse(BaseModel):
     reason: str
 
 
+class PracticeAnswerResponse(BaseModel):
+    """对已发布题目的服务端判分与最小学习记录结果。"""
+
+    question_id: str
+    content_version: str
+    selected_option: str
+    is_correct: bool
+    record_id: str
+
+
 class LearningRecordResponse(BaseModel):
     """当前认证用户已持久化的最小学习记录。"""
 
@@ -536,6 +555,12 @@ async def collect_runtime_metrics(request: Request, call_next):
 def learner_home() -> FileResponse:
     """返回匿名学习者可使用的同源逻辑验证页面。"""
     return FileResponse(static_directory / "index.html")
+
+
+@app.get("/practice")
+def learner_practice_home() -> FileResponse:
+    """返回依赖受信代理认证的已发布题库练习页面。"""
+    return FileResponse(static_directory / "practice.html")
 
 
 @app.get("/health")
@@ -776,6 +801,73 @@ def get_practice_recommendations(
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     return [_practice_recommendation_to_response(item) for item in recommendations]
+
+
+@app.get(
+    "/v1/learning/questions/{question_id}/{content_version}",
+    response_model=LearnerQuestionResponse,
+)
+def get_active_practice_question(
+    question_id: str,
+    content_version: str,
+    _: CurrentIdentity,
+) -> LearnerQuestionResponse:
+    """仅向认证学习者返回当前活动且已发布的最小题目视图。"""
+    try:
+        question = question_bank_store.get_active_learner_question(
+            question_id,
+            content_version,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if question is None:
+        raise HTTPException(status_code=404, detail="未找到可供练习的已发布题目")
+    return _learner_question_to_response(question)
+
+
+@app.post(
+    "/v1/learning/questions/{question_id}/{content_version}/attempts",
+    response_model=PracticeAnswerResponse,
+)
+def submit_practice_answer(
+    question_id: str,
+    content_version: str,
+    request: PracticeAnswerRequest,
+    identity: CurrentIdentity,
+) -> PracticeAnswerResponse:
+    """服务端以已审计发布版本判分并记录当前用户的最小学习结果。"""
+    try:
+        attempt = question_bank_store.grade_active_learner_answer(
+            question_id,
+            content_version,
+            request.selected_option,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if attempt is None:
+        raise HTTPException(status_code=404, detail="未找到可供练习的已发布题目")
+    if attempt.question.question_id in learning_store.attempted_question_ids(
+        identity.subject
+    ):
+        raise HTTPException(status_code=409, detail="该题已完成练习，请选择下一题")
+    record = learning_store.add_record(
+        LearningRecordInput(
+            user_id=identity.subject,
+            question_id=attempt.question.question_id,
+            question_type=attempt.question.question_type,
+            is_correct=attempt.is_correct,
+            error_tags=attempt.error_tags if not attempt.is_correct else (),
+            knowledge_tags=attempt.knowledge_tags,
+            duration_seconds=request.duration_seconds,
+        )
+    )
+    return PracticeAnswerResponse(
+        question_id=attempt.question.question_id,
+        content_version=attempt.question.content_version,
+        selected_option=request.selected_option.strip(),
+        is_correct=attempt.is_correct,
+        record_id=record.record_id,
+    )
 
 
 @app.delete("/v1/learning/records/{record_id}")

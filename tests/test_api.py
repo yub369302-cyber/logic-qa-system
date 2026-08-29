@@ -31,6 +31,20 @@ def test_learner_static_assets_are_available() -> None:
     assert "/v1/admin/" not in script.text
 
 
+def test_practice_home_and_assets_expose_only_learner_paths() -> None:
+    """练习页与脚本应同源可用，且页面不包含管理端入口。"""
+    page = client.get("/practice")
+    script = client.get("/assets/practice.js")
+
+    assert page.status_code == 200
+    assert "练习已审核发布的逻辑题" in page.text
+    assert "/v1/admin/" not in page.text
+    assert script.status_code == 200
+    assert "/v1/learning/recommendations" in script.text
+    assert "/v1/learning/questions/" in script.text
+    assert "/v1/admin/" not in script.text
+
+
 def test_health_check() -> None:
     """服务应暴露健康检查接口。"""
     response = client.get("/health")

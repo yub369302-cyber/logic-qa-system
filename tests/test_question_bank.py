@@ -711,6 +711,86 @@ def test_recommendation_excludes_attempted_questions_and_hides_internal_tags(
     assert not hasattr(recommendation.question, "error_tags")
 
 
+def test_get_active_learner_question_hides_internal_fields_and_history(
+    tmp_path: Path,
+) -> None:
+    """学习者只能读取当前活动版本，且领域对象不携带内部发布信息。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    first_candidate, first_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    second_candidate, second_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v2", stem="q-1 的新版题干"),
+    )
+    question_store.publish(first_candidate, "publisher-a", first_review)
+    question_store.publish(second_candidate, "publisher-a", second_review)
+
+    active = question_store.get_active_learner_question("q-1", "content-v2")
+
+    assert active is not None
+    assert active.stem == "q-1 的新版题干"
+    assert not hasattr(active, "content_hash")
+    assert not hasattr(active, "formalization")
+    assert question_store.get_active_learner_question("q-1", "content-v1") is None
+    assert question_store.get_active_learner_question("missing", "content-v1") is None
+
+
+def test_grade_active_learner_answer_uses_audited_option_and_keeps_tags_internal(
+    tmp_path: Path,
+) -> None:
+    """练习判分必须使用发布审计选项，而不是客户端声称的对错或答案。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    candidate, review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    question_store.publish(candidate, "publisher-a", review)
+
+    correct = question_store.grade_active_learner_answer("q-1", "content-v1", "B")
+    incorrect = question_store.grade_active_learner_answer("q-1", "content-v1", "A")
+
+    assert correct is not None
+    assert correct.is_correct is True
+    assert correct.error_tags == ("invalid_converse",)
+    assert correct.knowledge_tags == ("逆命题与逆否命题",)
+    assert incorrect is not None
+    assert incorrect.is_correct is False
+    assert (
+        question_store.grade_active_learner_answer("missing", "content-v1", "A")
+        is None
+    )
+    with pytest.raises(ValueError, match="所选选项不属于该题目"):
+        question_store.grade_active_learner_answer("q-1", "content-v1", "not-an-option")
+
+
+@pytest.mark.parametrize(
+    ("question_id", "content_version", "message"),
+    [
+        (" ", "content-v1", "题目标识不能为空"),
+        ("q-1", " ", "内容版本不能为空"),
+    ],
+)
+def test_get_active_learner_question_rejects_invalid_identifiers(
+    tmp_path: Path,
+    question_id: str,
+    content_version: str,
+    message: str,
+) -> None:
+    """学习者题目读取必须校验题号与内容版本，不能执行模糊查询。"""
+    with pytest.raises(ValueError, match=message):
+        _question_store(tmp_path).get_active_learner_question(
+            question_id,
+            content_version,
+        )
+
+
 def test_recommendation_rejects_invalid_limit(tmp_path: Path) -> None:
     """推荐数量越界时不应返回局部或隐式默认结果。"""
     with pytest.raises(ValueError, match="推荐数量"):

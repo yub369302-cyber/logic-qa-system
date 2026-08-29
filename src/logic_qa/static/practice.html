@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="仅练习审核发布且由服务端确定性验证的逻辑题目。"
+    />
+    <title>题库练习 · 可信逻辑答疑</title>
+    <link rel="stylesheet" href="/assets/app.css" />
+    <script src="/assets/practice.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#practice">跳至练习内容</a>
+    <header class="site-header">
+      <div class="page-shell header-content">
+        <a class="brand" href="/" aria-label="可信逻辑答疑首页">可信逻辑答疑</a>
+        <nav class="header-nav" aria-label="主导航">
+          <a href="/">自主验证</a>
+          <a href="/practice" aria-current="page">题库练习</a>
+          <a href="/docs">接口文档</a>
+        </nav>
+      </div>
+    </header>
+
+    <main class="page-shell practice-page" id="practice">
+      <section class="practice-hero" aria-labelledby="practice-title">
+        <p class="eyebrow">REVIEWED PRACTICE</p>
+        <h1 id="practice-title">练习已审核发布的逻辑题</h1>
+        <p>
+          题目、选项和判分均来自已发布版本。答案由服务端保存的确定性验证审计结果判定，浏览器不会保存或推断正确答案。
+        </p>
+      </section>
+
+      <section class="auth-notice" id="auth-notice" aria-labelledby="auth-title">
+        <p class="section-kicker">认证边界</p>
+        <h2 id="auth-title">此页面需要受信代理身份</h2>
+        <p>
+          推荐、取题与提交作答均依赖部署侧认证。若当前环境未注入身份，页面不会降级为匿名取题或客户端判分。
+        </p>
+      </section>
+
+      <section class="practice-layout">
+        <aside class="recommendation-panel panel" aria-labelledby="recommendation-title">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">练习列表</p>
+              <h2 id="recommendation-title">为你推荐</h2>
+            </div>
+            <button class="text-button" id="refresh-button" type="button">刷新</button>
+          </div>
+          <p class="field-help" id="recommendation-status" aria-live="polite">
+            正在读取已发布练习题。
+          </p>
+          <div class="recommendation-list" id="recommendation-list"></div>
+        </aside>
+
+        <article class="practice-card panel" id="question-panel" aria-labelledby="question-title">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker" id="question-type">等待取题</p>
+              <h2 id="question-title">选择一题开始练习</h2>
+            </div>
+            <span class="status-badge neutral" id="practice-badge">未开始</span>
+          </div>
+          <p class="practice-reason" id="practice-reason"></p>
+          <div class="question-body" id="question-body" hidden>
+            <p class="question-stem" id="question-stem"></p>
+            <form id="attempt-form">
+              <fieldset class="option-group" id="option-group">
+                <legend>选择你的答案</legend>
+              </fieldset>
+              <p class="form-error" id="attempt-error" role="alert" hidden></p>
+              <div class="form-actions">
+                <button class="primary-button" id="submit-attempt" type="submit">
+                  <span class="button-label">提交作答</span>
+                  <span class="button-loading" aria-hidden="true">正在核验…</span>
+                </button>
+                <p class="privacy-note">判分发生在服务端；作答记录仅归属当前认证用户。</p>
+              </div>
+            </form>
+          </div>
+          <section class="attempt-result" id="attempt-result" aria-live="polite" hidden></section>
+        </article>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="page-shell">
+        <p>可信逻辑答疑 MVP · 只展示已审核发布的练习题，不向学习者返回答案或审核资产。</p>
+      </div>
+    </footer>
+  </body>
+</html>

@@ -563,6 +563,178 @@ def test_candidate_snapshot_is_idempotent_and_retrievable(
     assert fetched.json() == first
 
 
+def test_active_practice_question_requires_identity_and_hides_internal_fields(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """练习接口只向认证主体提供活动发布题目，且不泄露发布与审核资产。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    first_payload = _publish_payload("q-1", "content-v1")
+    second_payload = {
+        **_publish_payload("q-1", "content-v2"),
+        "stem": "q-1 的新版题干",
+    }
+    for payload in (first_payload, second_payload):
+        _prepare_and_approve(client, payload)
+        published = client.post(
+            "/v1/admin/questions",
+            headers=_ADMIN_HEADERS,
+            json=payload,
+        )
+        assert published.status_code == 200
+
+    unauthenticated = client.get("/v1/learning/questions/q-1/content-v2")
+    historical = client.get(
+        "/v1/learning/questions/q-1/content-v1",
+        headers=_LEARNER_HEADERS,
+    )
+    active = client.get(
+        "/v1/learning/questions/q-1/content-v2",
+        headers=_LEARNER_HEADERS,
+    )
+
+    assert unauthenticated.status_code == 401
+    assert historical.status_code == 404
+    assert active.status_code == 200
+    learner_question = active.json()
+    assert learner_question == {
+        "question_id": "q-1",
+        "content_version": "content-v2",
+        "question_type": "propositional",
+        "stem": "q-1 的新版题干",
+        "options": ["A", "B"],
+    }
+    for forbidden_field in (
+        "content_hash",
+        "error_tags",
+        "knowledge_tags",
+        "formalization_version",
+        "formalization",
+        "reviewer_id",
+        "verified_answer",
+        "publisher_id",
+    ):
+        assert forbidden_field not in learner_question
+
+
+def test_practice_attempt_is_scored_server_side_and_records_current_user(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """作答接口必须从审计答案判分，并把题目标签仅写入当前用户学习记录。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    payload = _publish_payload("q-1", "content-v1")
+    _prepare_and_approve(client, payload)
+    published = client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=payload,
+    )
+    assert published.status_code == 200
+
+    unauthenticated = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        json={"selected_option": "B"},
+    )
+    manipulated = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={
+            "selected_option": "B",
+            "is_correct": False,
+            "user_id": "another-user",
+            "error_tags": ["client-controlled"],
+        },
+    )
+    incorrect = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "A", "duration_seconds": 12},
+    )
+    duplicate = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "B"},
+    )
+    invalid_option = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "not-an-option"},
+    )
+
+    assert unauthenticated.status_code == 401
+    assert manipulated.status_code == 422
+    assert incorrect.status_code == 200
+    assert incorrect.json() == {
+        "question_id": "q-1",
+        "content_version": "content-v1",
+        "selected_option": "A",
+        "is_correct": False,
+        "record_id": incorrect.json()["record_id"],
+    }
+    assert duplicate.status_code == 409
+    assert duplicate.json()["detail"] == "该题已完成练习，请选择下一题"
+    assert invalid_option.status_code == 422
+    assert invalid_option.json()["detail"] == "所选选项不属于该题目"
+
+    profile = client.get("/v1/learning/profile", headers=_LEARNER_HEADERS)
+    assert profile.status_code == 200
+    assert profile.json()["total_attempts"] == 1
+    assert profile.json()["correct_attempts"] == 0
+    assert profile.json()["error_counts"] == [["invalid_converse", 1]]
+    assert profile.json()["knowledge_mastery"] == [["逆命题与逆否命题", 0.0]]
+
+
+def test_practice_attempt_records_are_isolated_per_authenticated_user(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """同一题只能在同一用户范围内去重，其他认证用户可独立完成练习。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    payload = _publish_payload("q-1", "content-v1")
+    _prepare_and_approve(client, payload)
+    published = client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=payload,
+    )
+    assert published.status_code == 200
+
+    first_user = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "A"},
+    )
+    second_user = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers={
+            **_LEARNER_HEADERS,
+            "X-Logic-QA-Subject": "user-b",
+        },
+        json={"selected_option": "B"},
+    )
+
+    assert first_user.status_code == 200
+    assert second_user.status_code == 200
+    assert second_user.json()["is_correct"] is True
+
+
+def test_active_practice_question_rejects_invalid_identifiers(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """练习读取的标识不合法时必须明确拒绝，而不是回退到其他题目。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+
+    response = client.get(
+        "/v1/learning/questions/%20/content-v1",
+        headers=_LEARNER_HEADERS,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "题目标识不能为空"
+
+
 def test_recommendation_returns_unattempted_question_without_internal_fields(
     tmp_path: Path,
     monkeypatch,
