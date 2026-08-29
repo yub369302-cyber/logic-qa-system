@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import sqlite3
+from enum import StrEnum
 from pathlib import Path
 from time import perf_counter
 
@@ -547,6 +549,24 @@ class AdminPracticeCorrectionRepublicationResponse(BaseModel):
     linked_at: str
 
 
+class RepublicationVerificationStatus(StrEnum):
+    """跨学习库与题库核验重发布关联当前状态的只读结果。"""
+
+    ACTIVE_VERIFIED = "active_verified"
+    HISTORICAL_INACTIVE = "historical_inactive"
+    MISSING = "missing"
+    CONTENT_HASH_MISMATCH = "content_hash_mismatch"
+    REQUEST_BINDING_MISMATCH = "request_binding_mismatch"
+    UNVERIFIABLE = "unverifiable"
+
+
+class AdminPracticeCorrectionRepublicationVerificationResponse(BaseModel):
+    """关联版本在题库中的当前精确存在性与活动状态。"""
+
+    status: RepublicationVerificationStatus
+    observed_content_hash: str | None
+
+
 class AdminPracticeCorrectionEventResponse(BaseModel):
     """管理员审计视图中的一条追加式申请事件。"""
 
@@ -564,6 +584,9 @@ class AdminPracticeCorrectionAuditResponse(BaseModel):
 
     request: AdminPracticeCorrectionRequestResponse
     republication: AdminPracticeCorrectionRepublicationResponse | None
+    republication_verification: (
+        AdminPracticeCorrectionRepublicationVerificationResponse | None
+    )
     events: list[AdminPracticeCorrectionEventResponse]
 
 
@@ -1385,7 +1408,7 @@ def _admin_practice_correction_request_to_response(
 def _practice_correction_audit_to_response(
     audit: PracticeCorrectionAudit,
 ) -> AdminPracticeCorrectionAuditResponse:
-    """将不可变关联与事件链转换为管理员专用审计响应。"""
+    """将关联、跨库状态核验与事件链转换为管理员专用审计响应。"""
     republication = audit.republication
     return AdminPracticeCorrectionAuditResponse(
         request=_admin_practice_correction_request_to_response(audit.request),
@@ -1402,9 +1425,66 @@ def _practice_correction_audit_to_response(
             if republication is not None
             else None
         ),
+        republication_verification=_verify_republication_for_audit(audit),
         events=[
             _practice_correction_event_to_response(event) for event in audit.events
         ],
+    )
+
+
+def _verify_republication_for_audit(
+    audit: PracticeCorrectionAudit,
+) -> AdminPracticeCorrectionRepublicationVerificationResponse | None:
+    """只读核验关联绑定、精确发布版本及其当前活动状态。"""
+    republication = audit.republication
+    if republication is None:
+        return None
+    if (
+        republication.question_id != audit.request.question_id
+        or republication.previous_content_version != audit.request.content_version
+    ):
+        return AdminPracticeCorrectionRepublicationVerificationResponse(
+            status=RepublicationVerificationStatus.REQUEST_BINDING_MISMATCH,
+            observed_content_hash=None,
+        )
+    try:
+        published = question_bank_store.get_published_question(
+            republication.question_id,
+            republication.new_content_version,
+        )
+    except (OSError, sqlite3.Error, ValueError):
+        return AdminPracticeCorrectionRepublicationVerificationResponse(
+            status=RepublicationVerificationStatus.UNVERIFIABLE,
+            observed_content_hash=None,
+        )
+    if published is None:
+        return AdminPracticeCorrectionRepublicationVerificationResponse(
+            status=RepublicationVerificationStatus.MISSING,
+            observed_content_hash=None,
+        )
+    if published.content_hash != republication.new_content_hash:
+        return AdminPracticeCorrectionRepublicationVerificationResponse(
+            status=RepublicationVerificationStatus.CONTENT_HASH_MISMATCH,
+            observed_content_hash=published.content_hash,
+        )
+    try:
+        active = question_bank_store.get_active_published_question(
+            republication.question_id,
+            republication.new_content_version,
+        )
+    except (OSError, sqlite3.Error, ValueError):
+        return AdminPracticeCorrectionRepublicationVerificationResponse(
+            status=RepublicationVerificationStatus.UNVERIFIABLE,
+            observed_content_hash=published.content_hash,
+        )
+    if active is None:
+        return AdminPracticeCorrectionRepublicationVerificationResponse(
+            status=RepublicationVerificationStatus.HISTORICAL_INACTIVE,
+            observed_content_hash=published.content_hash,
+        )
+    return AdminPracticeCorrectionRepublicationVerificationResponse(
+        status=RepublicationVerificationStatus.ACTIVE_VERIFIED,
+        observed_content_hash=active.content_hash,
     )
 
 

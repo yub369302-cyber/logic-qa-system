@@ -1,12 +1,20 @@
 """内容绑定审核题库发布与学习者最小响应的集成测试。"""
 
+import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from logic_qa import api
-from logic_qa.learning_profile import LearningProfileStore
+from logic_qa.learning_profile import (
+    LearningProfileStore,
+    PracticeCorrectionAudit,
+    PracticeCorrectionRepublication,
+    PracticeCorrectionRequest,
+    PracticeCorrectionRequestStatus,
+)
 from logic_qa.quality_operations import QuestionReviewStore, RuntimeMetrics
 from logic_qa.question_bank import QuestionBankStore
 from logic_qa.question_bank_api import router as question_bank_router
@@ -119,6 +127,41 @@ def _prepare_and_approve(
     candidate = _prepare_candidate(client, payload)
     _approve_candidate(client, candidate)
     return candidate
+
+
+def _correction_audit_with_republication(
+    *,
+    republication_question_id: str = "q-1",
+    previous_content_version: str = "content-v1",
+) -> PracticeCorrectionAudit:
+    """构造只用于审计异常核验的不可变关联视图。"""
+    request = PracticeCorrectionRequest(
+        request_id="request-1",
+        record_id="record-1",
+        user_id="user-a",
+        question_id="q-1",
+        content_version="content-v1",
+        reason="需要重发布",
+        status=PracticeCorrectionRequestStatus.REPUBLICATION_REQUIRED,
+        created_at="2026-08-29T00:00:00+00:00",
+        resolved_by="admin-a",
+        resolution_notes=None,
+        resolved_at="2026-08-29T00:00:00+00:00",
+    )
+    republication = PracticeCorrectionRepublication(
+        request_id=request.request_id,
+        question_id=republication_question_id,
+        previous_content_version=previous_content_version,
+        new_content_version="content-v2",
+        new_content_hash="a" * 64,
+        linked_by="admin-a",
+        linked_at="2026-08-29T00:00:00+00:00",
+    )
+    return PracticeCorrectionAudit(
+        request=request,
+        republication=republication,
+        events=(),
+    )
 
 
 def test_question_bank_routes_are_registered_once() -> None:
@@ -790,6 +833,149 @@ def test_republication_outcome_downgrades_when_linked_version_is_deactivated(
     )
     assert "republished_content_version" not in downgraded_outcome.json()[0]
 
+    audit = client.get(
+        f"/v1/admin/practice-correction-audits/{request_id}",
+        headers=_ADMIN_HEADERS,
+    )
+
+    assert audit.status_code == 200
+    assert audit.json()["republication_verification"] == {
+        "status": "historical_inactive",
+        "observed_content_hash": audit.json()["republication"]["new_content_hash"],
+    }
+
+
+def test_admin_correction_audit_reports_missing_republication_version(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """题库独立恢复而缺少关联版本时，管理员审计必须标记为缺失。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    first_payload = _publish_payload("q-1", "content-v1")
+    _prepare_and_approve(client, first_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=first_payload,
+    ).status_code == 200
+    question_backup = api.question_bank_store.create_backup(
+        tmp_path / "question-backups"
+    )
+    attempt = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "A"},
+    )
+    assert attempt.status_code == 200
+    correction_request = client.post(
+        "/v1/learning/practice-correction-requests",
+        headers=_LEARNER_HEADERS,
+        json={"record_id": attempt.json()["record_id"], "reason": "需要重发布"},
+    )
+    assert correction_request.status_code == 200
+    request_id = correction_request.json()["request_id"]
+    assert client.post(
+        f"/v1/admin/practice-correction-requests/{request_id}/resolution",
+        headers=_ADMIN_HEADERS,
+        json={"resolution": "republication_required"},
+    ).status_code == 200
+    second_payload = {
+        **_publish_payload("q-1", "content-v2"),
+        "stem": "q-1 的缺失关联新版题干",
+    }
+    _prepare_and_approve(client, second_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=second_payload,
+    ).status_code == 200
+    assert client.post(
+        "/v1/admin/questions/q-1/content-v2/correction-republication-links",
+        headers=_ADMIN_HEADERS,
+        json={"request_id": request_id, "previous_content_version": "content-v1"},
+    ).status_code == 200
+    api.question_bank_store.restore_backup(
+        api.question_bank_store.load_backup(question_backup.manifest_path)
+    )
+
+    audit = client.get(
+        f"/v1/admin/practice-correction-audits/{request_id}",
+        headers=_ADMIN_HEADERS,
+    )
+
+    assert audit.status_code == 200
+    assert audit.json()["republication_verification"] == {
+        "status": "missing",
+        "observed_content_hash": None,
+    }
+
+
+def test_republication_audit_verification_detects_abnormal_cross_store_facts(
+    monkeypatch,
+) -> None:
+    """异常关联或不可读题库只能被标记，不会覆盖任何已有审计事实。"""
+    binding_mismatch = _correction_audit_with_republication(
+        republication_question_id="q-2"
+    )
+
+    binding_result = api._verify_republication_for_audit(binding_mismatch)
+
+    assert binding_result is not None
+    assert (
+        binding_result.status
+        is api.RepublicationVerificationStatus.REQUEST_BINDING_MISMATCH
+    )
+    assert binding_result.observed_content_hash is None
+
+    class HashMismatchStore:
+        """返回同版本但不同摘要的历史发布事实。"""
+
+        def get_published_question(
+            self,
+            question_id: str,
+            content_version: str,
+        ) -> SimpleNamespace:
+            assert (question_id, content_version) == ("q-1", "content-v2")
+            return SimpleNamespace(content_hash="b" * 64)
+
+        def get_active_published_question(
+            self,
+            question_id: str,
+            content_version: str,
+        ) -> None:
+            raise AssertionError("摘要不匹配时不应继续读取活动状态")
+
+    monkeypatch.setattr(api, "question_bank_store", HashMismatchStore())
+    hash_result = api._verify_republication_for_audit(
+        _correction_audit_with_republication()
+    )
+
+    assert hash_result is not None
+    assert (
+        hash_result.status
+        is api.RepublicationVerificationStatus.CONTENT_HASH_MISMATCH
+    )
+    assert hash_result.observed_content_hash == "b" * 64
+
+    class UnavailableStore:
+        """模拟题库独立存储暂时不可读取。"""
+
+        def get_published_question(
+            self,
+            question_id: str,
+            content_version: str,
+        ) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(api, "question_bank_store", UnavailableStore())
+    unavailable_result = api._verify_republication_for_audit(
+        _correction_audit_with_republication()
+    )
+
+    assert unavailable_result is not None
+    assert unavailable_result.status is api.RepublicationVerificationStatus.UNVERIFIABLE
+    assert unavailable_result.observed_content_hash is None
+
 
 def test_active_practice_question_requires_identity_and_hides_internal_fields(
     tmp_path: Path,
@@ -1419,6 +1605,10 @@ def test_admin_correction_audit_routes_return_link_and_complete_event_chain(
         "new_content_hash": candidate["content_hash"],
         "linked_by": "admin-a",
         "linked_at": payload["republication"]["linked_at"],
+    }
+    assert payload["republication_verification"] == {
+        "status": "active_verified",
+        "observed_content_hash": candidate["content_hash"],
     }
     assert [event["event_type"] for event in payload["events"]] == [
         "requested",
