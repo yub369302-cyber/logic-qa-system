@@ -673,7 +673,7 @@ def test_practice_attempt_is_scored_server_side_and_records_current_user(
         "record_id": incorrect.json()["record_id"],
     }
     assert duplicate.status_code == 409
-    assert duplicate.json()["detail"] == "该题已完成练习，请选择下一题"
+    assert duplicate.json()["detail"] == "该题目版本已完成练习，请选择下一题"
     assert invalid_option.status_code == 422
     assert invalid_option.json()["detail"] == "所选选项不属于该题目"
 
@@ -754,18 +754,12 @@ def test_recommendation_returns_unattempted_question_without_internal_fields(
         )
         assert response.status_code == 200
 
-    record = client.post(
-        "/v1/learning/records",
+    attempt = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
         headers=_LEARNER_HEADERS,
-        json={
-            "question_id": "q-1",
-            "question_type": "propositional",
-            "is_correct": False,
-            "error_tags": ["invalid_converse"],
-            "knowledge_tags": ["逆命题与逆否命题"],
-        },
+        json={"selected_option": "A"},
     )
-    assert record.status_code == 200
+    assert attempt.status_code == 200
 
     recommendations = client.get(
         "/v1/learning/recommendations?limit=3",
@@ -798,3 +792,87 @@ def test_recommendation_returns_unattempted_question_without_internal_fields(
     ):
         assert forbidden_field not in recommendation
         assert forbidden_field not in recommendation["question"]
+
+
+def test_generic_learning_record_does_not_exclude_published_practice_version(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """未绑定版本的通用记录不得影响发布题练习推荐。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    payload = _publish_payload("q-1", "content-v1")
+    _prepare_and_approve(client, payload)
+    published = client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=payload,
+    )
+    assert published.status_code == 200
+
+    generic_record = client.post(
+        "/v1/learning/records",
+        headers=_LEARNER_HEADERS,
+        json={
+            "question_id": "q-1",
+            "question_type": "propositional",
+            "is_correct": False,
+        },
+    )
+    recommendations = client.get(
+        "/v1/learning/recommendations?limit=3",
+        headers=_LEARNER_HEADERS,
+    )
+
+    assert generic_record.status_code == 200
+    assert recommendations.status_code == 200
+    assert recommendations.json()[0]["question"]["question_id"] == "q-1"
+    assert recommendations.json()[0]["question"]["content_version"] == "content-v1"
+
+
+def test_recommendation_includes_a_new_active_version_after_old_version_attempt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """同一题发布新版本后，应向已完成旧版本的用户重新开放新版本。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    first_payload = _publish_payload("q-1", "content-v1")
+    _prepare_and_approve(client, first_payload)
+    first_published = client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=first_payload,
+    )
+    assert first_published.status_code == 200
+
+    first_attempt = client.post(
+        "/v1/learning/questions/q-1/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "B"},
+    )
+    assert first_attempt.status_code == 200
+
+    second_payload = {
+        **_publish_payload("q-1", "content-v2"),
+        "stem": "q-1 的新版题干",
+    }
+    _prepare_and_approve(client, second_payload)
+    second_published = client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=second_payload,
+    )
+    assert second_published.status_code == 200
+
+    recommendations = client.get(
+        "/v1/learning/recommendations?limit=3",
+        headers=_LEARNER_HEADERS,
+    )
+
+    assert recommendations.status_code == 200
+    assert recommendations.json()[0]["question"] == {
+        "question_id": "q-1",
+        "content_version": "content-v2",
+        "question_type": "propositional",
+        "stem": "q-1 的新版题干",
+        "options": ["A", "B"],
+    }

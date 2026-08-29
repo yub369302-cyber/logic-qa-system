@@ -698,7 +698,7 @@ def test_recommendation_excludes_attempted_questions_and_hides_internal_tags(
 
     recommendations = question_store.recommend(
         profile=_profile(),
-        attempted_question_ids=("q-1",),
+        attempted_question_versions=(("q-1", "content-v1"),),
         limit=3,
     )
 

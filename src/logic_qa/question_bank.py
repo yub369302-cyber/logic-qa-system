@@ -641,13 +641,13 @@ class QuestionBankStore:
     def recommend(
         self,
         profile: LearningProfile,
-        attempted_question_ids: tuple[str, ...],
+        attempted_question_versions: tuple[tuple[str, str], ...],
         limit: int,
     ) -> tuple[PracticeRecommendation, ...]:
-        """从未尝试活动题目中生成不泄露内部标签的个人练习推荐。"""
+        """从未尝试的活动发布版本中生成不泄露内部标签的个人推荐。"""
         if not 1 <= limit <= 20:
             raise ValueError("推荐数量必须位于 1 到 20 之间")
-        attempted = set(attempted_question_ids)
+        attempted = set(attempted_question_versions)
         error_weights = dict(profile.error_counts)
         knowledge_weights = {
             tag: 1.0 - mastery for tag, mastery in profile.knowledge_mastery
@@ -655,7 +655,7 @@ class QuestionBankStore:
         scored: list[tuple[float, PublishedQuestion, tuple[str, ...], str]] = []
 
         for question in self.active_questions():
-            if question.question_id in attempted:
+            if (question.question_id, question.content_version) in attempted:
                 continue
             error_matches = tuple(
                 tag for tag in question.error_tags if tag in error_weights
