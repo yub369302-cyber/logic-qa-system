@@ -1077,7 +1077,7 @@ def get_practice_correction_outcomes(
 def _verified_republished_content_version(
     outcome: PracticeCorrectionOutcome,
 ) -> str | None:
-    """仅在题库仍保存精确摘要的发布事实时向学习者展示关联版本。"""
+    """仅在题库可读、版本活动且摘要精确匹配时展示关联版本。"""
     if outcome.republished_content_version is None:
         return None
     republication = learning_store.get_practice_correction_republication(
@@ -1085,10 +1085,13 @@ def _verified_republished_content_version(
     )
     if republication is None:
         return None
-    published = question_bank_store.get_active_published_question(
-        outcome.question_id,
-        republication.new_content_version,
-    )
+    try:
+        published = question_bank_store.get_active_published_question(
+            outcome.question_id,
+            republication.new_content_version,
+        )
+    except (OSError, sqlite3.Error, ValueError):
+        return None
     if published is None or published.content_hash != republication.new_content_hash:
         return None
     return published.content_version
