@@ -591,8 +591,9 @@ class AdminPracticeCorrectionAuditResponse(BaseModel):
 
 
 class AdminPracticeCorrectionReconciliationResponse(BaseModel):
-    """一页跨库重发布关联巡检结果，只报告当前未精确活动核验的关联。"""
+    """一个持久边界冻结的跨库重发布关联巡检页。"""
 
+    scan_boundary: int | None
     total_linked_audits: int
     offset: int
     scanned_linked_audits: int
@@ -1157,12 +1158,14 @@ def reconcile_admin_practice_correction_republications(
     _: AdminIdentity,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=10_000),
+    scan_boundary: int | None = Query(default=None, ge=1),
 ) -> AdminPracticeCorrectionReconciliationResponse:
-    """分页巡检所有不可变关联，只读报告跨库当前核验异常。"""
+    """分页巡检持久边界冻结的不可变关联，只读报告当前异常。"""
     try:
         audit_page = learning_store.list_linked_practice_correction_audit_page(
             limit=limit,
             offset=offset,
+            scan_boundary=scan_boundary,
         )
     except (OSError, sqlite3.Error) as error:
         raise HTTPException(
@@ -1184,6 +1187,7 @@ def reconcile_admin_practice_correction_republications(
     scanned_linked_audits = len(audit_responses)
     next_offset = offset + scanned_linked_audits
     return AdminPracticeCorrectionReconciliationResponse(
+        scan_boundary=audit_page.scan_boundary,
         total_linked_audits=total_linked_audits,
         offset=offset,
         scanned_linked_audits=scanned_linked_audits,

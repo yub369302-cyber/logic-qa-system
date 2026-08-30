@@ -986,6 +986,7 @@ def test_admin_correction_audit_reports_missing_republication_version(
 
     assert reconciliation.status_code == 200
     reconciliation_payload = reconciliation.json()
+    assert reconciliation_payload["scan_boundary"] == 1
     assert reconciliation_payload["total_linked_audits"] == 1
     assert reconciliation_payload["offset"] == 0
     assert reconciliation_payload["scanned_linked_audits"] == 1
@@ -1052,23 +1053,28 @@ def test_admin_republication_reconciliation_paginates_linked_audits(
         "/v1/admin/practice-correction-reconciliations?limit=1",
         headers=_ADMIN_HEADERS,
     )
+    assert first_page.status_code == 200
+    first_page_payload = first_page.json()
+    scan_boundary = first_page_payload["scan_boundary"]
+    assert scan_boundary == 2
     second_page = client.get(
-        "/v1/admin/practice-correction-reconciliations?limit=1&offset=1",
+        "/v1/admin/practice-correction-reconciliations"
+        f"?limit=1&offset=1&scan_boundary={scan_boundary}",
         headers=_ADMIN_HEADERS,
     )
     empty_page = client.get(
-        "/v1/admin/practice-correction-reconciliations?limit=1&offset=2",
+        "/v1/admin/practice-correction-reconciliations"
+        f"?limit=1&offset=2&scan_boundary={scan_boundary}",
         headers=_ADMIN_HEADERS,
     )
 
-    assert first_page.status_code == 200
-    first_page_payload = first_page.json()
     assert first_page_payload["total_linked_audits"] == 2
     assert first_page_payload["offset"] == 0
     assert first_page_payload["scanned_linked_audits"] == 1
     assert first_page_payload["next_offset"] == 1
     assert second_page.status_code == 200
     second_page_payload = second_page.json()
+    assert second_page_payload["scan_boundary"] == scan_boundary
     assert second_page_payload["total_linked_audits"] == 2
     assert second_page_payload["offset"] == 1
     assert second_page_payload["scanned_linked_audits"] == 1
@@ -1089,6 +1095,7 @@ def test_admin_republication_reconciliation_paginates_linked_audits(
     )
     assert empty_page.status_code == 200
     assert empty_page.json() == {
+        "scan_boundary": scan_boundary,
         "total_linked_audits": 2,
         "offset": 2,
         "scanned_linked_audits": 0,
@@ -1096,6 +1103,138 @@ def test_admin_republication_reconciliation_paginates_linked_audits(
         "next_offset": None,
         "non_verified_audits": [],
     }
+
+
+def test_reconciliation_scan_boundary_excludes_new_links_until_next_scan(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """管理端必须用首响应边界完成同一轮分页，不混入后续新关联。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    for question_id in ("q-1", "q-2"):
+        first_payload = _publish_payload(question_id, "content-v1")
+        _prepare_and_approve(client, first_payload)
+        assert client.post(
+            "/v1/admin/questions",
+            headers=_ADMIN_HEADERS,
+            json=first_payload,
+        ).status_code == 200
+        attempt = client.post(
+            f"/v1/learning/questions/{question_id}/content-v1/attempts",
+            headers=_LEARNER_HEADERS,
+            json={"selected_option": "A"},
+        )
+        assert attempt.status_code == 200
+        correction_request = client.post(
+            "/v1/learning/practice-correction-requests",
+            headers=_LEARNER_HEADERS,
+            json={"record_id": attempt.json()["record_id"], "reason": "需要重发布"},
+        )
+        assert correction_request.status_code == 200
+        request_id = correction_request.json()["request_id"]
+        assert client.post(
+            f"/v1/admin/practice-correction-requests/{request_id}/resolution",
+            headers=_ADMIN_HEADERS,
+            json={"resolution": "republication_required"},
+        ).status_code == 200
+        second_payload = {
+            **_publish_payload(question_id, "content-v2"),
+            "stem": f"{question_id} 的边界巡检新版题干",
+        }
+        _prepare_and_approve(client, second_payload)
+        assert client.post(
+            "/v1/admin/questions",
+            headers=_ADMIN_HEADERS,
+            json=second_payload,
+        ).status_code == 200
+        assert client.post(
+            f"/v1/admin/questions/{question_id}/content-v2/"
+            "correction-republication-links",
+            headers=_ADMIN_HEADERS,
+            json={"request_id": request_id, "previous_content_version": "content-v1"},
+        ).status_code == 200
+
+    first_page = client.get(
+        "/v1/admin/practice-correction-reconciliations?limit=1",
+        headers=_ADMIN_HEADERS,
+    )
+
+    assert first_page.status_code == 200
+    first_page_payload = first_page.json()
+    scan_boundary = first_page_payload["scan_boundary"]
+    assert scan_boundary == 2
+    assert first_page_payload["total_linked_audits"] == 2
+    third_payload = _publish_payload("q-3", "content-v1")
+    _prepare_and_approve(client, third_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=third_payload,
+    ).status_code == 200
+    third_attempt = client.post(
+        "/v1/learning/questions/q-3/content-v1/attempts",
+        headers=_LEARNER_HEADERS,
+        json={"selected_option": "A"},
+    )
+    assert third_attempt.status_code == 200
+    third_correction_request = client.post(
+        "/v1/learning/practice-correction-requests",
+        headers=_LEARNER_HEADERS,
+        json={"record_id": third_attempt.json()["record_id"], "reason": "需要重发布"},
+    )
+    assert third_correction_request.status_code == 200
+    third_request_id = third_correction_request.json()["request_id"]
+    assert client.post(
+        f"/v1/admin/practice-correction-requests/{third_request_id}/resolution",
+        headers=_ADMIN_HEADERS,
+        json={"resolution": "republication_required"},
+    ).status_code == 200
+    third_second_payload = {
+        **_publish_payload("q-3", "content-v2"),
+        "stem": "q-3 的边界巡检新版题干",
+    }
+    _prepare_and_approve(client, third_second_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=third_second_payload,
+    ).status_code == 200
+    assert client.post(
+        "/v1/admin/questions/q-3/content-v2/correction-republication-links",
+        headers=_ADMIN_HEADERS,
+        json={"request_id": third_request_id, "previous_content_version": "content-v1"},
+    ).status_code == 200
+    second_page = client.get(
+        "/v1/admin/practice-correction-reconciliations"
+        f"?limit=1&offset=1&scan_boundary={scan_boundary}",
+        headers=_ADMIN_HEADERS,
+    )
+    exhausted_page = client.get(
+        "/v1/admin/practice-correction-reconciliations"
+        f"?limit=1&offset=2&scan_boundary={scan_boundary}",
+        headers=_ADMIN_HEADERS,
+    )
+    fresh_scan = client.get(
+        "/v1/admin/practice-correction-reconciliations?limit=10",
+        headers=_ADMIN_HEADERS,
+    )
+
+    assert second_page.status_code == 200
+    assert second_page.json()["scan_boundary"] == scan_boundary
+    assert second_page.json()["total_linked_audits"] == 2
+    assert exhausted_page.status_code == 200
+    assert exhausted_page.json()["scan_boundary"] == scan_boundary
+    assert exhausted_page.json()["total_linked_audits"] == 2
+    assert exhausted_page.json()["scanned_linked_audits"] == 0
+    assert fresh_scan.status_code == 200
+    assert fresh_scan.json()["scan_boundary"] > scan_boundary
+    assert fresh_scan.json()["total_linked_audits"] == 3
+    invalid_boundary = client.get(
+        "/v1/admin/practice-correction-reconciliations?scan_boundary=999",
+        headers=_ADMIN_HEADERS,
+    )
+    assert invalid_boundary.status_code == 422
+    assert invalid_boundary.json()["detail"] == "巡检扫描边界不存在"
 
 
 def test_reconciliation_fails_closed_when_learning_store_is_unavailable(
@@ -1113,6 +1252,7 @@ def test_reconciliation_fails_closed_when_learning_store_is_unavailable(
             *,
             limit: int,
             offset: int,
+            scan_boundary: int | None,
         ) -> None:
             raise sqlite3.OperationalError("database is locked")
 
@@ -1844,6 +1984,7 @@ def test_admin_correction_audit_routes_return_link_and_complete_event_chain(
 
     assert reconciliation.status_code == 200
     assert reconciliation.json() == {
+        "scan_boundary": 1,
         "total_linked_audits": 1,
         "offset": 0,
         "scanned_linked_audits": 1,
