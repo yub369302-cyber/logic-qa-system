@@ -27,6 +27,48 @@ def _store(tmp_path: Path) -> LearningProfileStore:
     return LearningProfileStore(tmp_path / "learning.sqlite3")
 
 
+def _create_linked_correction_request(
+    store: LearningProfileStore,
+    *,
+    question_id: str,
+    user_id: str,
+) -> str:
+    """创建一条需要重发布且已不可变关联的最小审计数据。"""
+    record = store.record_practice_attempt(
+        LearningRecordInput(
+            user_id=user_id,
+            question_id=question_id,
+            content_version="content-v1",
+            question_type="propositional",
+            is_correct=False,
+        )
+    )
+    correction_request = store.create_practice_correction_request(
+        PracticeCorrectionRequestInput(
+            user_id=user_id,
+            record_id=record.record_id,
+            reason="需要重发布",
+        )
+    )
+    assert correction_request is not None
+    assert store.resolve_practice_correction_request(
+        PracticeCorrectionResolutionInput(
+            request_id=correction_request.request_id,
+            resolver_id="admin-a",
+            resolution=PracticeCorrectionResolution.REPUBLICATION_REQUIRED,
+        )
+    ) is not None
+    assert store.link_practice_correction_republication(
+        request_id=correction_request.request_id,
+        question_id=question_id,
+        previous_content_version="content-v1",
+        new_content_version="content-v2",
+        new_content_hash="a" * 64,
+        linked_by="admin-a",
+    ) is not None
+    return correction_request.request_id
+
+
 def test_records_are_isolated_by_user_and_profile_uses_own_statistics(
     tmp_path: Path,
 ) -> None:
@@ -188,7 +230,7 @@ def test_learning_store_migrates_once_and_restores_manifest_backup(
     reloaded_store.restore_backup(reloaded_backup)
 
     profile = reloaded_store.get_profile("user-a")
-    assert reloaded_store.schema_version() == 4
+    assert reloaded_store.schema_version() == 5
     assert backup.manifest_path.is_file()
     assert profile.total_attempts == 1
     assert reloaded_store.attempted_question_ids("user-a") == (first.question_id,)
@@ -251,7 +293,7 @@ def test_learning_store_upgrades_v1_records_to_versioned_practice_schema(
         )
     )
 
-    assert store.schema_version() == 4
+    assert store.schema_version() == 5
     assert store.get_profile("user-a").total_attempts == 2
     assert versioned_record.content_version == "content-v1"
     assert store.attempted_practice_versions("user-a") == (
@@ -897,7 +939,7 @@ def test_learning_store_upgrades_v3_correction_schema_to_republication_schema(
 
     store = LearningProfileStore(database_path)
 
-    assert store.schema_version() == 4
+    assert store.schema_version() == 5
     assert store.get_profile("user-a").total_attempts == 1
     assert store.list_practice_correction_requests_for_user("user-a")[0].request_id == (
         "request-v1"
@@ -909,6 +951,15 @@ def test_learning_store_upgrades_v3_correction_schema_to_republication_schema(
                 "PRAGMA table_info(practice_correction_republications)"
             ).fetchall()
         }
+        scan_sequence_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(practice_correction_republication_scan_sequences)"
+            ).fetchall()
+        }
+        scan_sequence_count = connection.execute(
+            "SELECT COUNT(*) FROM practice_correction_republication_scan_sequences"
+        ).fetchone()[0]
     assert columns == {
         "request_id",
         "question_id",
@@ -918,6 +969,8 @@ def test_learning_store_upgrades_v3_correction_schema_to_republication_schema(
         "linked_by",
         "linked_at",
     }
+    assert scan_sequence_columns == {"scan_sequence", "request_id"}
+    assert scan_sequence_count == 0
 
 
 def test_learning_store_upgrades_v2_ledger_to_correction_request_schema(
@@ -982,12 +1035,114 @@ def test_learning_store_upgrades_v2_ledger_to_correction_request_schema(
         )
     )
 
-    assert store.schema_version() == 4
+    assert store.schema_version() == 5
     assert request is not None
     assert request.status.value == "pending"
     assert store.get_profile("user-a").total_attempts == 1
     assert store.get_profile("user-a").correct_attempts == 0
     assert store.attempted_practice_versions("user-a") == (("q-1", "content-v1"),)
+
+
+def test_learning_store_backfills_v4_republication_scan_sequences(
+    tmp_path: Path,
+) -> None:
+    """升级既有 v4 关联时，扫描序号必须按既有不可变关联稳定回填。"""
+    database_path = tmp_path / "learning.sqlite3"
+    store = LearningProfileStore(database_path)
+    first_request_id = _create_linked_correction_request(
+        store,
+        question_id="q-1",
+        user_id="user-a",
+    )
+    second_request_id = _create_linked_correction_request(
+        store,
+        question_id="q-2",
+        user_id="user-b",
+    )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE practice_correction_republications
+            SET linked_at = CASE request_id
+                WHEN ? THEN '2026-08-30T00:00:00+00:00'
+                WHEN ? THEN '2026-08-30T00:00:01+00:00'
+            END
+            """,
+            (first_request_id, second_request_id),
+        )
+        connection.execute(
+            "DROP TABLE practice_correction_republication_scan_sequences"
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 5")
+
+    upgraded_store = LearningProfileStore(database_path)
+    page = upgraded_store.list_linked_practice_correction_audit_page(limit=10)
+
+    assert upgraded_store.schema_version() == 5
+    assert page.scan_boundary == 2
+    assert page.total_linked_audits == 2
+    assert [audit.request.request_id for audit in page.audits] == [
+        first_request_id,
+        second_request_id,
+    ]
+
+
+def test_linked_audit_page_freezes_multi_page_scan_boundary(
+    tmp_path: Path,
+) -> None:
+    """后续分页只读取首响应边界内的关联，不混入扫描期间的新关联。"""
+    store = _store(tmp_path)
+    first_request_id = _create_linked_correction_request(
+        store,
+        question_id="q-1",
+        user_id="user-a",
+    )
+    second_request_id = _create_linked_correction_request(
+        store,
+        question_id="q-2",
+        user_id="user-b",
+    )
+
+    first_page = store.list_linked_practice_correction_audit_page(limit=1)
+
+    assert first_page.scan_boundary is not None
+    assert first_page.total_linked_audits == 2
+    assert first_page.audits[0].request.request_id == first_request_id
+    third_request_id = _create_linked_correction_request(
+        store,
+        question_id="q-3",
+        user_id="user-c",
+    )
+    second_page = store.list_linked_practice_correction_audit_page(
+        limit=1,
+        offset=1,
+        scan_boundary=first_page.scan_boundary,
+    )
+    exhausted_page = store.list_linked_practice_correction_audit_page(
+        limit=1,
+        offset=2,
+        scan_boundary=first_page.scan_boundary,
+    )
+    fresh_page = store.list_linked_practice_correction_audit_page(limit=10)
+
+    assert second_page.scan_boundary == first_page.scan_boundary
+    assert second_page.total_linked_audits == 2
+    assert second_page.audits[0].request.request_id == second_request_id
+    assert exhausted_page.scan_boundary == first_page.scan_boundary
+    assert exhausted_page.total_linked_audits == 2
+    assert exhausted_page.audits == ()
+    assert fresh_page.scan_boundary is not None
+    assert fresh_page.scan_boundary > first_page.scan_boundary
+    assert fresh_page.total_linked_audits == 3
+    assert {
+        audit.request.request_id for audit in fresh_page.audits
+    } == {first_request_id, second_request_id, third_request_id}
+    with pytest.raises(ValueError, match="扫描边界必须为正整数"):
+        store.list_linked_practice_correction_audit_page(scan_boundary=0)
+    with pytest.raises(ValueError, match="扫描边界不存在"):
+        store.list_linked_practice_correction_audit_page(
+            scan_boundary=fresh_page.scan_boundary + 1
+        )
 
 
 def test_practice_correction_audit_query_returns_immutable_link_and_event_chain(

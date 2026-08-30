@@ -197,8 +197,9 @@ class PracticeCorrectionAudit:
 
 @dataclass(frozen=True, slots=True)
 class LinkedPracticeCorrectionAuditPage:
-    """同一学习库读取快照内的已关联申请总数和稳定分页审计视图。"""
+    """同一学习库读取快照内、受持久扫描边界约束的关联审计页。"""
 
+    scan_boundary: int | None
     total_linked_audits: int
     audits: tuple[PracticeCorrectionAudit, ...]
 
@@ -253,6 +254,11 @@ class LearningProfileStore:
                     4,
                     "add_practice_correction_republications",
                     self._migrate_v4,
+                ),
+                DatabaseMigration(
+                    5,
+                    "add_republication_scan_sequences",
+                    self._migrate_v5,
                 ),
             ),
         )
@@ -545,6 +551,14 @@ class LearningProfileStore:
             try:
                 connection.execute(
                     """
+                    INSERT INTO practice_correction_republication_scan_sequences (
+                        request_id
+                    ) VALUES (?)
+                    """,
+                    (normalized_request_id,),
+                )
+                connection.execute(
+                    """
                     INSERT INTO practice_correction_republications (
                         request_id, question_id, previous_content_version,
                         new_content_version, new_content_hash, linked_by, linked_at
@@ -704,25 +718,45 @@ class LearningProfileStore:
         *,
         limit: int = 50,
         offset: int = 0,
+        scan_boundary: int | None = None,
     ) -> LinkedPracticeCorrectionAuditPage:
-        """在同一学习库读取快照中统计并分页读取不可变重发布关联。"""
+        """在同一读取快照内读取由持久边界冻结的不可变关联审计页。"""
         _validate_audit_page_arguments(limit=limit, offset=offset)
+        _validate_reconciliation_scan_boundary(scan_boundary)
         with self._connect() as connection:
             connection.execute("BEGIN")
-            total_linked_audits = _count_linked_practice_correction_audits(connection)
-            rows = connection.execute(
-                f"""
-                SELECT {_PRACTICE_CORRECTION_REQUEST_COLUMNS}
-                FROM practice_correction_requests AS request
-                WHERE EXISTS (
-                    SELECT 1
-                    FROM practice_correction_republications AS republication
-                    WHERE republication.request_id = request.request_id
+            maximum_scan_sequence = _maximum_republication_scan_sequence(connection)
+            resolved_scan_boundary = _resolve_reconciliation_scan_boundary(
+                connection,
+                requested_boundary=scan_boundary,
+                maximum_scan_sequence=maximum_scan_sequence,
+            )
+            if resolved_scan_boundary is None:
+                return LinkedPracticeCorrectionAuditPage(
+                    scan_boundary=None,
+                    total_linked_audits=0,
+                    audits=(),
                 )
-                ORDER BY request.created_at ASC, request.request_id ASC
+            total_linked_audits = _count_linked_practice_correction_audits(
+                connection,
+                scan_boundary=resolved_scan_boundary,
+            )
+            rows = connection.execute(
+                """
+                SELECT request.request_id, request.record_id, request.user_id,
+                       request.question_id, request.content_version, request.reason,
+                       request.status, request.created_at, request.resolved_by,
+                       request.resolution_notes, request.resolved_at
+                FROM practice_correction_requests AS request
+                INNER JOIN practice_correction_republications AS republication
+                    ON republication.request_id = request.request_id
+                INNER JOIN practice_correction_republication_scan_sequences AS scan
+                    ON scan.request_id = republication.request_id
+                WHERE scan.scan_sequence <= ?
+                ORDER BY scan.scan_sequence ASC
                 LIMIT ? OFFSET ?
                 """,
-                (limit, offset),
+                (resolved_scan_boundary, limit, offset),
             ).fetchall()
             requests = tuple(
                 _practice_correction_request_from_row(row) for row in rows
@@ -736,6 +770,7 @@ class LearningProfileStore:
                 (request.request_id for request in requests),
             )
         return LinkedPracticeCorrectionAuditPage(
+            scan_boundary=resolved_scan_boundary,
             total_linked_audits=total_linked_audits,
             audits=tuple(
                 PracticeCorrectionAudit(
@@ -748,9 +783,13 @@ class LearningProfileStore:
         )
 
     def count_linked_practice_correction_audits(self) -> int:
-        """返回当前学习库中不可变重发布关联的精确数量。"""
+        """在同一学习库读取快照中返回当前不可变重发布关联总数。"""
         with self._connect() as connection:
-            return _count_linked_practice_correction_audits(connection)
+            connection.execute("BEGIN")
+            return _count_linked_practice_correction_audits(
+                connection,
+                scan_boundary=_maximum_republication_scan_sequence(connection),
+            )
 
     def resolve_practice_correction_request(
         self,
@@ -957,6 +996,25 @@ class LearningProfileStore:
             """
         )
 
+    def _migrate_v5(self, connection: sqlite3.Connection) -> None:
+        """为不可变关联建立单调扫描序号，冻结多页巡检的输入集合。"""
+        connection.execute(
+            """
+            CREATE TABLE practice_correction_republication_scan_sequences (
+                scan_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO practice_correction_republication_scan_sequences (request_id)
+            SELECT request_id
+            FROM practice_correction_republications
+            ORDER BY linked_at ASC, request_id ASC
+            """
+        )
+
     def _republications_by_request_id(
         self,
         request_ids: Iterable[str],
@@ -1005,19 +1063,66 @@ def _validate_audit_page_arguments(*, limit: int, offset: int) -> None:
         raise ValueError("审计查询偏移量必须介于 0 到 10000")
 
 
+def _validate_reconciliation_scan_boundary(scan_boundary: int | None) -> None:
+    if scan_boundary is not None and scan_boundary < 1:
+        raise ValueError("巡检扫描边界必须为正整数")
+
+
+def _resolve_reconciliation_scan_boundary(
+    connection: sqlite3.Connection,
+    *,
+    requested_boundary: int | None,
+    maximum_scan_sequence: int | None,
+) -> int | None:
+    if requested_boundary is None:
+        return maximum_scan_sequence
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM practice_correction_republication_scan_sequences
+        WHERE scan_sequence = ?
+        """,
+        (requested_boundary,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("巡检扫描边界不存在")
+    return requested_boundary
+
+
+def _maximum_republication_scan_sequence(
+    connection: sqlite3.Connection,
+) -> int | None:
+    row = connection.execute(
+        """
+        SELECT MAX(scan_sequence) AS maximum_scan_sequence
+        FROM practice_correction_republication_scan_sequences
+        """
+    ).fetchone()
+    return (
+        int(row["maximum_scan_sequence"])
+        if row["maximum_scan_sequence"] is not None
+        else None
+    )
+
+
 def _count_linked_practice_correction_audits(
     connection: sqlite3.Connection,
+    *,
+    scan_boundary: int | None = None,
 ) -> int:
+    if scan_boundary is None:
+        return 0
     row = connection.execute(
         """
         SELECT COUNT(*) AS audit_count
         FROM practice_correction_requests AS request
-        WHERE EXISTS (
-            SELECT 1
-            FROM practice_correction_republications AS republication
-            WHERE republication.request_id = request.request_id
-        )
-        """
+        INNER JOIN practice_correction_republications AS republication
+            ON republication.request_id = request.request_id
+        INNER JOIN practice_correction_republication_scan_sequences AS scan
+            ON scan.request_id = republication.request_id
+        WHERE scan.scan_sequence <= ?
+        """,
+        (scan_boundary,),
     ).fetchone()
     return int(row["audit_count"])
 
