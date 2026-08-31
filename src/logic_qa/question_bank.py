@@ -327,6 +327,11 @@ class QuestionBankStore:
                     "validate_question_version_lifecycle_references",
                     self._migrate_v6,
                 ),
+                DatabaseMigration(
+                    7,
+                    "protect_formalization_verification_audit",
+                    self._migrate_v7,
+                ),
             ),
         )
         self._database.migrate()
@@ -1259,6 +1264,27 @@ class QuestionBankStore:
                         )
                     THEN RAISE(ABORT, '生命周期审计替代版本必须已发布且属于同一题目')
                 END;
+            END
+            """
+        )
+
+    def _migrate_v7(self, connection: sqlite3.Connection) -> None:
+        """禁止直接改写或删除形式化验证审计事件。"""
+        connection.execute(
+            """
+            CREATE TRIGGER trg_question_formalization_verification_events_no_update
+            BEFORE UPDATE ON question_formalization_verification_events
+            BEGIN
+                SELECT RAISE(ABORT, '形式化验证审计事件不可修改');
+            END
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER trg_question_formalization_verification_events_no_delete
+            BEFORE DELETE ON question_formalization_verification_events
+            BEGIN
+                SELECT RAISE(ABORT, '形式化验证审计事件不可删除');
             END
             """
         )
