@@ -332,6 +332,11 @@ class QuestionBankStore:
                     "protect_formalization_verification_audit",
                     self._migrate_v7,
                 ),
+                DatabaseMigration(
+                    8,
+                    "validate_formalization_verification_references",
+                    self._migrate_v8,
+                ),
             ),
         )
         self._database.migrate()
@@ -1285,6 +1290,47 @@ class QuestionBankStore:
             BEFORE DELETE ON question_formalization_verification_events
             BEGIN
                 SELECT RAISE(ABORT, '形式化验证审计事件不可删除');
+            END
+            """
+        )
+
+    def _migrate_v8(self, connection: sqlite3.Connection) -> None:
+        """确保验证审计只引用真实且摘要一致的已发布版本。"""
+        invalid = connection.execute(
+            """
+            SELECT event_id
+            FROM question_formalization_verification_events AS event
+            LEFT JOIN question_versions AS version
+                ON version.question_id = event.question_id
+                AND version.content_version = event.content_version
+                AND version.content_hash = event.content_hash
+            WHERE version.question_id IS NULL
+            ORDER BY event.rowid ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalid is not None:
+            raise RuntimeError(
+                "形式化验证事件引用不存在或摘要不一致的题目版本，"
+                "拒绝启用引用完整性约束："
+                f"{invalid['event_id']}"
+            )
+        connection.execute(
+            """
+            CREATE TRIGGER
+                trg_question_formalization_verification_events_reference_versions
+            BEFORE INSERT ON question_formalization_verification_events
+            BEGIN
+                SELECT CASE
+                    WHEN NOT EXISTS (
+                        SELECT 1
+                        FROM question_versions
+                        WHERE question_id = NEW.question_id
+                            AND content_version = NEW.content_version
+                            AND content_hash = NEW.content_hash
+                        )
+                    THEN RAISE(ABORT, '形式化验证事件必须引用摘要一致的已发布版本')
+                END;
             END
             """
         )
