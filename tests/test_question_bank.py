@@ -2,11 +2,14 @@
 
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
+import logic_qa.question_bank as question_bank_module
 from logic_qa.grouping_matching_solver import (
     GroupConstraint,
     GroupConstraintType,
@@ -688,6 +691,77 @@ def test_new_version_deactivates_old_version_but_keeps_history(tmp_path: Path) -
     assert superseded.replaced_content_version == second.content_version
     assert superseded.reason == "发布新的已审核内容版本"
     assert superseded.created_at == second.published_at
+
+
+def test_version_event_timestamps_are_created_after_immediate_transaction_starts(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """发布、下线和回滚的审计时间必须属于实际写入事务。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    first_candidate, first_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    first = question_store.publish(first_candidate, "publisher-a", first_review)
+    second_candidate, second_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v2", stem="q-1 的时间序列新版题干"),
+    )
+    immediate_transaction_started = False
+    original_connect = question_store._connect
+
+    @contextmanager
+    def tracked_connect():
+        nonlocal immediate_transaction_started
+        with original_connect() as connection:
+
+            class TrackedConnection:
+                def execute(
+                    self,
+                    sql: str,
+                    parameters: tuple[object, ...] = (),
+                ) -> sqlite3.Cursor:
+                    nonlocal immediate_transaction_started
+                    if sql.strip() == "BEGIN IMMEDIATE":
+                        immediate_transaction_started = True
+                    return connection.execute(sql, parameters)
+
+            yield TrackedConnection()
+
+    class TransactionTimestamp:
+        @staticmethod
+        def now(*args: object, **kwargs: object) -> datetime:
+            assert immediate_transaction_started
+            return datetime.now(*args, **kwargs)
+
+    monkeypatch.setattr(question_store, "_connect", tracked_connect)
+    monkeypatch.setattr(question_bank_module, "datetime", TransactionTimestamp)
+
+    second = question_store.publish(second_candidate, "publisher-a", second_review)
+    assert second.content_version == "content-v2"
+
+    immediate_transaction_started = False
+    deactivated = question_store.deactivate_active_version(
+        second.question_id,
+        second.content_version,
+        actor_id="admin-a",
+        reason="验证下线审计时间的事务归属",
+    )
+    assert deactivated is not None
+
+    immediate_transaction_started = False
+    reactivated = question_store.reactivate_published_version(
+        first.question_id,
+        first.content_version,
+        actor_id="admin-a",
+        reason="验证回滚审计时间的事务归属",
+        review=first_review,
+    )
+    assert reactivated is not None
 
 
 def test_publish_rejects_a_corrupted_question_with_multiple_active_versions(
