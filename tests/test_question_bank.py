@@ -789,6 +789,9 @@ def test_publish_rejects_a_corrupted_question_with_multiple_active_versions(
     second = question_store.publish(second_candidate, "publisher-a", second_review)
     with question_store._connect() as connection:
         connection.execute(
+            "DROP INDEX idx_question_versions_one_active_per_question"
+        )
+        connection.execute(
             """
             UPDATE question_versions
             SET is_active = 1
@@ -1284,7 +1287,7 @@ def test_recommendation_rejects_invalid_limit(tmp_path: Path) -> None:
 def test_question_store_upgrades_v1_to_lifecycle_governance_schema(
     tmp_path: Path,
 ) -> None:
-    """既有 v1 题库升级时只新增治理审计表，不改写已发布版本。"""
+    """既有 v1 题库升级时只添加治理结构，不改写已发布版本。"""
     question_store = _question_store(tmp_path)
     review_store = _review_store(tmp_path)
     candidate, review = _approved_review(
@@ -1295,11 +1298,16 @@ def test_question_store_upgrades_v1_to_lifecycle_governance_schema(
     published = question_store.publish(candidate, "publisher-a", review)
     with question_store._connect() as connection:
         connection.execute("DROP TABLE question_version_lifecycle_events")
-        connection.execute("DELETE FROM schema_migrations WHERE version IN (2, 3)")
+        connection.execute(
+            "DROP INDEX idx_question_versions_one_active_per_question"
+        )
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version IN (2, 3, 4)"
+        )
 
     upgraded_store = _question_store(tmp_path)
 
-    assert upgraded_store.schema_version() == 3
+    assert upgraded_store.schema_version() == 4
     assert upgraded_store.active_questions() == (published,)
     assert upgraded_store.list_question_version_lifecycle_events("q-1") == ()
     with sqlite3.connect(tmp_path / "questions.sqlite3") as connection:
@@ -1392,11 +1400,14 @@ def test_question_store_upgrades_v2_lifecycle_events_for_supersession(
             ON question_version_lifecycle_events (question_id, created_at)
             """
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version = 3")
+        connection.execute(
+            "DROP INDEX idx_question_versions_one_active_per_question"
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version IN (3, 4)")
 
     upgraded_store = _question_store(tmp_path)
 
-    assert upgraded_store.schema_version() == 3
+    assert upgraded_store.schema_version() == 4
     assert upgraded_store.list_question_version_lifecycle_events("q-1") == (
         deactivated,
         reactivated,
@@ -1410,6 +1421,87 @@ def test_question_store_upgrades_v2_lifecycle_events_for_supersession(
             """
         ).fetchone()[0]
     assert "'superseded'" in table_sql
+
+
+def test_question_store_prevents_multiple_active_versions_in_sqlite(
+    tmp_path: Path,
+) -> None:
+    """部分唯一索引必须阻止绕过领域方法写入同题多个活动版本。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    first_candidate, first_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    second_candidate, second_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v2", stem="q-1 的索引约束新版题干"),
+    )
+    first = question_store.publish(first_candidate, "publisher-a", first_review)
+    second = question_store.publish(second_candidate, "publisher-a", second_review)
+
+    with question_store._connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                UPDATE question_versions
+                SET is_active = 1
+                WHERE question_id = ? AND content_version = ?
+                """,
+                (first.question_id, first.content_version),
+            )
+
+    assert question_store.active_questions() == (second,)
+
+
+def test_question_store_rejects_duplicate_active_versions_when_upgrading_to_v4(
+    tmp_path: Path,
+) -> None:
+    """迁移遇到损坏的多活动版本状态时必须关闭，而不能任意选择版本。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    first_candidate, first_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    second_candidate, second_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v2", stem="q-1 的损坏状态新版题干"),
+    )
+    first = question_store.publish(first_candidate, "publisher-a", first_review)
+    second = question_store.publish(second_candidate, "publisher-a", second_review)
+    with question_store._connect() as connection:
+        connection.execute(
+            "DROP INDEX idx_question_versions_one_active_per_question"
+        )
+        connection.execute(
+            "UPDATE question_versions SET is_active = 1 WHERE question_id = ?",
+            (first.question_id,),
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 4")
+
+    with pytest.raises(RuntimeError, match="多个活动版本"):
+        _question_store(tmp_path)
+
+    with sqlite3.connect(tmp_path / "questions.sqlite3") as connection:
+        rows = connection.execute(
+            """
+            SELECT content_version, is_active
+            FROM question_versions
+            WHERE question_id = ?
+            ORDER BY content_version ASC
+            """,
+            (first.question_id,),
+        ).fetchall()
+        schema_version = connection.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+        ).fetchone()[0]
+    assert rows == [(first.content_version, 1), (second.content_version, 1)]
+    assert schema_version == 3
 
 
 def test_question_store_restores_candidate_publication_and_audit_snapshot(
@@ -1453,7 +1545,7 @@ def test_question_store_restores_candidate_publication_and_audit_snapshot(
 
     question_store.restore_backup(question_store.load_backup(backup.manifest_path))
 
-    assert question_store.schema_version() == 3
+    assert question_store.schema_version() == 4
     assert question_store.active_questions() == (first_published,)
     assert question_store.list_question_version_lifecycle_events("q-1") == (
         first_deactivation,
