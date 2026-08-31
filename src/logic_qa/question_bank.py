@@ -337,6 +337,11 @@ class QuestionBankStore:
                     "validate_formalization_verification_references",
                     self._migrate_v8,
                 ),
+                DatabaseMigration(
+                    9,
+                    "protect_candidate_snapshots_and_publication_events",
+                    self._migrate_v9,
+                ),
             ),
         )
         self._database.migrate()
@@ -1331,6 +1336,45 @@ class QuestionBankStore:
                         )
                     THEN RAISE(ABORT, '形式化验证事件必须引用摘要一致的已发布版本')
                 END;
+            END
+            """
+        )
+
+    def _migrate_v9(self, connection: sqlite3.Connection) -> None:
+        """禁止改写或删除候选快照与发布事件。"""
+        connection.execute(
+            """
+            CREATE TRIGGER trg_question_candidates_no_update
+            BEFORE UPDATE ON question_candidates
+            BEGIN
+                SELECT RAISE(ABORT, '题目候选快照不可修改');
+            END
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER trg_question_candidates_no_delete
+            BEFORE DELETE ON question_candidates
+            BEGIN
+                SELECT RAISE(ABORT, '题目候选快照不可删除');
+            END
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER trg_question_publication_events_no_update
+            BEFORE UPDATE ON question_publication_events
+            BEGIN
+                SELECT RAISE(ABORT, '题目发布事件不可修改');
+            END
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER trg_question_publication_events_no_delete
+            BEFORE DELETE ON question_publication_events
+            BEGIN
+                SELECT RAISE(ABORT, '题目发布事件不可删除');
             END
             """
         )

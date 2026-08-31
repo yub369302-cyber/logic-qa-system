@@ -1022,6 +1022,9 @@ def test_reactivation_requires_current_exact_approval_and_immutable_candidate(
     assert question_store.active_questions()[0].content_version == "content-v2"
 
     with question_store._connect() as connection:
+        # v9 触发器在正常库中阻止删除快照；这里显式移除保护，
+        # 模拟保护失效的损坏库，以检验领域层仍拒绝缺失快照。
+        connection.execute("DROP TRIGGER trg_question_candidates_no_delete")
         connection.execute(
             """
             DELETE FROM question_candidates
@@ -1311,13 +1314,21 @@ def test_question_store_upgrades_v1_to_lifecycle_governance_schema(
             "DROP TRIGGER "
             "trg_question_formalization_verification_events_reference_versions"
         )
+        connection.execute("DROP TRIGGER trg_question_candidates_no_update")
+        connection.execute("DROP TRIGGER trg_question_candidates_no_delete")
         connection.execute(
-            "DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8)"
+            "DROP TRIGGER trg_question_publication_events_no_update"
+        )
+        connection.execute(
+            "DROP TRIGGER trg_question_publication_events_no_delete"
+        )
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9)"
         )
 
     upgraded_store = _question_store(tmp_path)
 
-    assert upgraded_store.schema_version() == 8
+    assert upgraded_store.schema_version() == 9
     assert upgraded_store.active_questions() == (published,)
     assert upgraded_store.list_question_version_lifecycle_events("q-1") == ()
     with sqlite3.connect(tmp_path / "questions.sqlite3") as connection:
@@ -1423,13 +1434,21 @@ def test_question_store_upgrades_v2_lifecycle_events_for_supersession(
             "DROP TRIGGER "
             "trg_question_formalization_verification_events_reference_versions"
         )
+        connection.execute("DROP TRIGGER trg_question_candidates_no_update")
+        connection.execute("DROP TRIGGER trg_question_candidates_no_delete")
         connection.execute(
-            "DELETE FROM schema_migrations WHERE version IN (3, 4, 5, 6, 7, 8)"
+            "DROP TRIGGER trg_question_publication_events_no_update"
+        )
+        connection.execute(
+            "DROP TRIGGER trg_question_publication_events_no_delete"
+        )
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version IN (3, 4, 5, 6, 7, 8, 9)"
         )
 
     upgraded_store = _question_store(tmp_path)
 
-    assert upgraded_store.schema_version() == 8
+    assert upgraded_store.schema_version() == 9
     assert upgraded_store.list_question_version_lifecycle_events("q-1") == (
         deactivated,
         reactivated,
@@ -1626,8 +1645,16 @@ def test_question_store_rejects_duplicate_active_versions_when_upgrading_to_v4(
             "DROP TRIGGER "
             "trg_question_formalization_verification_events_reference_versions"
         )
+        connection.execute("DROP TRIGGER trg_question_candidates_no_update")
+        connection.execute("DROP TRIGGER trg_question_candidates_no_delete")
         connection.execute(
-            "DELETE FROM schema_migrations WHERE version IN (4, 5, 6, 7, 8)"
+            "DROP TRIGGER trg_question_publication_events_no_update"
+        )
+        connection.execute(
+            "DROP TRIGGER trg_question_publication_events_no_delete"
+        )
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version IN (4, 5, 6, 7, 8, 9)"
         )
 
     with pytest.raises(RuntimeError, match="多个活动版本"):
@@ -1690,13 +1717,21 @@ def test_question_store_upgrades_v4_lifecycle_events_with_storage_protection(
             "DROP TRIGGER "
             "trg_question_formalization_verification_events_reference_versions"
         )
+        connection.execute("DROP TRIGGER trg_question_candidates_no_update")
+        connection.execute("DROP TRIGGER trg_question_candidates_no_delete")
         connection.execute(
-            "DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8)"
+            "DROP TRIGGER trg_question_publication_events_no_update"
+        )
+        connection.execute(
+            "DROP TRIGGER trg_question_publication_events_no_delete"
+        )
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9)"
         )
 
     upgraded_store = _question_store(tmp_path)
 
-    assert upgraded_store.schema_version() == 8
+    assert upgraded_store.schema_version() == 9
     assert upgraded_store.list_question_version_lifecycle_events("q-1") == (event,)
     with upgraded_store._connect() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="不可删除"):
@@ -1752,7 +1787,17 @@ def test_question_store_rejects_invalid_lifecycle_audit_references_when_upgradin
             "DROP TRIGGER "
             "trg_question_formalization_verification_events_reference_versions"
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version IN (6, 7, 8)")
+        connection.execute("DROP TRIGGER trg_question_candidates_no_update")
+        connection.execute("DROP TRIGGER trg_question_candidates_no_delete")
+        connection.execute(
+            "DROP TRIGGER trg_question_publication_events_no_update"
+        )
+        connection.execute(
+            "DROP TRIGGER trg_question_publication_events_no_delete"
+        )
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version IN (6, 7, 8, 9)"
+        )
 
     with pytest.raises(RuntimeError, match="引用不存在或摘要不一致"):
         _question_store(tmp_path)
@@ -1864,11 +1909,19 @@ def test_question_store_upgrades_v6_formalization_audit_with_storage_protection(
             "DROP TRIGGER "
             "trg_question_formalization_verification_events_reference_versions"
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version IN (7, 8)")
+        connection.execute("DROP TRIGGER trg_question_candidates_no_update")
+        connection.execute("DROP TRIGGER trg_question_candidates_no_delete")
+        connection.execute(
+            "DROP TRIGGER trg_question_publication_events_no_update"
+        )
+        connection.execute(
+            "DROP TRIGGER trg_question_publication_events_no_delete"
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version IN (7, 8, 9)")
 
     upgraded_store = _question_store(tmp_path)
 
-    assert upgraded_store.schema_version() == 8
+    assert upgraded_store.schema_version() == 9
     verification = upgraded_store.get_formalization_verification(
         published.question_id,
         published.content_version,
@@ -2018,7 +2071,15 @@ def test_question_store_rejects_forged_verification_references_when_upgrading_to
                 published.published_at,
             ),
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version = 8")
+        connection.execute("DROP TRIGGER trg_question_candidates_no_update")
+        connection.execute("DROP TRIGGER trg_question_candidates_no_delete")
+        connection.execute(
+            "DROP TRIGGER trg_question_publication_events_no_update"
+        )
+        connection.execute(
+            "DROP TRIGGER trg_question_publication_events_no_delete"
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version IN (8, 9)")
 
     with pytest.raises(RuntimeError, match="引用不存在或摘要不一致"):
         _question_store(tmp_path)
@@ -2037,6 +2098,89 @@ def test_question_store_rejects_forged_verification_references_when_upgrading_to
         ).fetchone()[0]
     assert event == ("0" * 64,)
     assert schema_version == 7
+
+
+def test_question_store_prevents_candidate_and_publication_event_rewrites(
+    tmp_path: Path,
+) -> None:
+    """SQLite 触发器必须阻止改写或删除候选快照与发布事件。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    candidate, review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    published = question_store.publish(candidate, "publisher-a", review)
+
+    with question_store._connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="候选快照不可修改"):
+            connection.execute(
+                "UPDATE question_candidates SET stem = ? WHERE question_id = ?",
+                ("被篡改的题干", published.question_id),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="候选快照不可删除"):
+            connection.execute(
+                "DELETE FROM question_candidates WHERE question_id = ?",
+                (published.question_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="发布事件不可修改"):
+            connection.execute(
+                """
+                UPDATE question_publication_events
+                SET publisher_id = ?
+                WHERE question_id = ?
+                """,
+                ("attacker", published.question_id),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="发布事件不可删除"):
+            connection.execute(
+                "DELETE FROM question_publication_events WHERE question_id = ?",
+                (published.question_id,),
+            )
+
+    assert question_store.active_questions() == (published,)
+
+
+def test_question_store_upgrades_v8_snapshots_with_storage_protection(
+    tmp_path: Path,
+) -> None:
+    """升级到 v9 后既有快照与发布事件保持不变，并获得不可变保护。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    candidate, review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    published = question_store.publish(candidate, "publisher-a", review)
+
+    with question_store._connect() as connection:
+        connection.execute("DROP TRIGGER trg_question_candidates_no_update")
+        connection.execute("DROP TRIGGER trg_question_candidates_no_delete")
+        connection.execute(
+            "DROP TRIGGER trg_question_publication_events_no_update"
+        )
+        connection.execute(
+            "DROP TRIGGER trg_question_publication_events_no_delete"
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 9")
+
+    upgraded_store = _question_store(tmp_path)
+
+    assert upgraded_store.schema_version() == 9
+    assert upgraded_store.active_questions() == (published,)
+    with upgraded_store._connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="候选快照不可删除"):
+            connection.execute(
+                "DELETE FROM question_candidates WHERE question_id = ?",
+                (published.question_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="发布事件不可删除"):
+            connection.execute(
+                "DELETE FROM question_publication_events WHERE question_id = ?",
+                (published.question_id,),
+            )
 
 
 def test_question_store_restores_candidate_publication_and_audit_snapshot(
@@ -2080,7 +2224,7 @@ def test_question_store_restores_candidate_publication_and_audit_snapshot(
 
     question_store.restore_backup(question_store.load_backup(backup.manifest_path))
 
-    assert question_store.schema_version() == 8
+    assert question_store.schema_version() == 9
     assert question_store.active_questions() == (first_published,)
     assert question_store.list_question_version_lifecycle_events("q-1") == (
         first_deactivation,
