@@ -645,6 +645,7 @@ class QuestionBankStore:
         normalized_reason = _validate_text(reason, "下线原因", max_length=2_000)
         created_at = datetime.now(UTC).isoformat()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
                 SELECT question_id, content_version, content_hash, question_type, stem,
