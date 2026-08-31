@@ -451,20 +451,6 @@ class QuestionBankStore:
         self._validate_formalization_verification(verification)
         verification = self._evaluate_option_semantics(candidate, verification)
         self._validate_review(candidate, review)
-        published_at = datetime.now(UTC).isoformat()
-        question = PublishedQuestion(
-            question_id=candidate.publication.question_id,
-            content_version=candidate.publication.content_version,
-            question_type=candidate.publication.question_type,
-            stem=candidate.publication.stem,
-            options=candidate.publication.options,
-            error_tags=candidate.publication.error_tags,
-            knowledge_tags=candidate.publication.knowledge_tags,
-            formalization_version=candidate.publication.formalization_version,
-            formalization=candidate.publication.formalization,
-            content_hash=candidate.content_hash,
-            published_at=published_at,
-        )
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -473,7 +459,10 @@ class QuestionBankStore:
                 SELECT 1 FROM question_versions
                 WHERE question_id = ? AND content_version = ?
                 """,
-                (question.question_id, question.content_version),
+                (
+                    candidate.publication.question_id,
+                    candidate.publication.content_version,
+                ),
             ).fetchone()
             if existing is not None:
                 raise ValueError("该题目内容版本已发布，已发布版本不可覆盖")
@@ -486,12 +475,26 @@ class QuestionBankStore:
                 WHERE question_id = ? AND is_active = 1
                 ORDER BY content_version ASC
                 """,
-                (question.question_id,),
+                (candidate.publication.question_id,),
             ).fetchall()
             if len(active_rows) > 1:
                 raise ValueError("该题目存在多个活动版本，拒绝发布新版本")
             superseded_question = (
                 _question_from_row(active_rows[0]) if active_rows else None
+            )
+            published_at = datetime.now(UTC).isoformat()
+            question = PublishedQuestion(
+                question_id=candidate.publication.question_id,
+                content_version=candidate.publication.content_version,
+                question_type=candidate.publication.question_type,
+                stem=candidate.publication.stem,
+                options=candidate.publication.options,
+                error_tags=candidate.publication.error_tags,
+                knowledge_tags=candidate.publication.knowledge_tags,
+                formalization_version=candidate.publication.formalization_version,
+                formalization=candidate.publication.formalization,
+                content_hash=candidate.content_hash,
+                published_at=published_at,
             )
             connection.execute(
                 "UPDATE question_versions SET is_active = 0 WHERE question_id = ?",
@@ -643,7 +646,6 @@ class QuestionBankStore:
         )
         normalized_actor_id = _validate_text(actor_id, "操作人标识", max_length=128)
         normalized_reason = _validate_text(reason, "下线原因", max_length=2_000)
-        created_at = datetime.now(UTC).isoformat()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -661,6 +663,7 @@ class QuestionBankStore:
             if not row["is_active"]:
                 raise ValueError("该题目版本当前未活动，不能下线")
             question = _question_from_row(row)
+            created_at = datetime.now(UTC).isoformat()
             cursor = connection.execute(
                 """
                 UPDATE question_versions
@@ -718,7 +721,6 @@ class QuestionBankStore:
         self._validate_formalization_verification(verification)
         verification = self._evaluate_option_semantics(candidate, verification)
         self._validate_review(candidate, review)
-        created_at = datetime.now(UTC).isoformat()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             target = connection.execute(
@@ -752,6 +754,7 @@ class QuestionBankStore:
             replaced_content_version = (
                 superseded_question.content_version if superseded_question else None
             )
+            created_at = datetime.now(UTC).isoformat()
             connection.execute(
                 "UPDATE question_versions SET is_active = 0 WHERE question_id = ?",
                 (normalized_question_id,),
