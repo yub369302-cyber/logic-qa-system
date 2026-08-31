@@ -316,7 +316,7 @@ class QuestionVersionLifecycleRequest(BaseModel):
 
 
 class QuestionVersionLifecycleEventResponse(BaseModel):
-    """管理员可回查的版本下线或重新激活审计事实。"""
+    """管理员可回查的版本下线、替换或重新激活审计事实。"""
 
     event_id: str
     question_id: str
@@ -582,7 +582,7 @@ def list_question_version_lifecycle_events(
     _: AdminIdentity,
     dependencies: QuestionBankDependenciesInput,
 ) -> list[QuestionVersionLifecycleEventResponse]:
-    """回查同一题目全部下线与重新激活事件，不读取或修改学习账本。"""
+    """回查同一题目全部下线、替换与重新激活事件，不修改学习账本。"""
     try:
         store = dependencies.question_bank_store
         events = store.list_question_version_lifecycle_events(question_id)

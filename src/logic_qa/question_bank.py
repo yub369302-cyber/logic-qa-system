@@ -63,10 +63,11 @@ class FormalizationKind(StrEnum):
 
 
 class QuestionVersionLifecycleAction(StrEnum):
-    """已发布版本可由管理员追加的受控生命周期动作。"""
+    """已发布版本可由受控治理链路追加的生命周期动作。"""
 
     DEACTIVATED = "deactivated"
     REACTIVATED = "reactivated"
+    SUPERSEDED = "superseded"
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,7 +246,7 @@ class PublishedQuestionVerificationSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class QuestionVersionLifecycleEvent:
-    """下线或重新激活已发布版本时追加的不可变治理事件。"""
+    """已发布版本状态变更时追加的不可变治理事件。"""
 
     event_id: str
     question_id: str
@@ -305,6 +306,11 @@ class QuestionBankStore:
                     2,
                     "add_question_version_lifecycle_events",
                     self._migrate_v2,
+                ),
+                DatabaseMigration(
+                    3,
+                    "allow_published_version_supersession_events",
+                    self._migrate_v3,
                 ),
             ),
         )
@@ -461,6 +467,7 @@ class QuestionBankStore:
         )
 
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 """
                 SELECT 1 FROM question_versions
@@ -470,7 +477,22 @@ class QuestionBankStore:
             ).fetchone()
             if existing is not None:
                 raise ValueError("该题目内容版本已发布，已发布版本不可覆盖")
-
+            active_rows = connection.execute(
+                """
+                SELECT question_id, content_version, content_hash, question_type, stem,
+                       options, error_tags, knowledge_tags, formalization_version,
+                       formalization, published_at
+                FROM question_versions
+                WHERE question_id = ? AND is_active = 1
+                ORDER BY content_version ASC
+                """,
+                (question.question_id,),
+            ).fetchall()
+            if len(active_rows) > 1:
+                raise ValueError("该题目存在多个活动版本，拒绝发布新版本")
+            superseded_question = (
+                _question_from_row(active_rows[0]) if active_rows else None
+            )
             connection.execute(
                 "UPDATE question_versions SET is_active = 0 WHERE question_id = ?",
                 (question.question_id,),
@@ -520,6 +542,16 @@ class QuestionBankStore:
                 verification=verification,
                 created_at=question.published_at,
             )
+            if superseded_question is not None:
+                _insert_question_version_lifecycle_event(
+                    connection,
+                    question=superseded_question,
+                    action=QuestionVersionLifecycleAction.SUPERSEDED,
+                    actor_id=normalized_publisher,
+                    replaced_content_version=question.content_version,
+                    reason="发布新的已审核内容版本",
+                    created_at=question.published_at,
+                )
         return question
 
     def active_questions(self) -> tuple[PublishedQuestion, ...]:
@@ -748,7 +780,7 @@ class QuestionBankStore:
         self,
         question_id: str,
     ) -> tuple[QuestionVersionLifecycleEvent, ...]:
-        """按题号回查下线与重新激活的不可变治理事件。"""
+        """按题号回查下线、替换与重新激活的不可变治理事件。"""
         normalized_question_id = _validate_text(question_id, "题目标识", max_length=128)
         with self._connect() as connection:
             rows = connection.execute(
@@ -1044,6 +1076,51 @@ class QuestionBankStore:
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_question_version_lifecycle_events_q_created
+            ON question_version_lifecycle_events (question_id, created_at)
+            """
+        )
+
+    def _migrate_v3(self, connection: sqlite3.Connection) -> None:
+        """扩展生命周期动作约束，并原样保留既有不可变审计事件。"""
+        connection.execute(
+            """
+            ALTER TABLE question_version_lifecycle_events
+            RENAME TO question_version_lifecycle_events_v2
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE question_version_lifecycle_events (
+                event_id TEXT PRIMARY KEY,
+                question_id TEXT NOT NULL,
+                content_version TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                action TEXT NOT NULL CHECK (
+                    action IN ('deactivated', 'reactivated', 'superseded')
+                ),
+                actor_id TEXT NOT NULL,
+                replaced_content_version TEXT,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO question_version_lifecycle_events (
+                event_id, question_id, content_version, content_hash, action, actor_id,
+                replaced_content_version, reason, created_at
+            )
+            SELECT event_id, question_id, content_version, content_hash, action,
+                   actor_id, replaced_content_version, reason, created_at
+            FROM question_version_lifecycle_events_v2
+            ORDER BY rowid ASC
+            """
+        )
+        connection.execute("DROP TABLE question_version_lifecycle_events_v2")
+        connection.execute(
+            """
+            CREATE INDEX idx_question_version_lifecycle_events_q_created
             ON question_version_lifecycle_events (question_id, created_at)
             """
         )
