@@ -312,6 +312,11 @@ class QuestionBankStore:
                     "allow_published_version_supersession_events",
                     self._migrate_v3,
                 ),
+                DatabaseMigration(
+                    4,
+                    "enforce_one_active_question_version",
+                    self._migrate_v4,
+                ),
             ),
         )
         self._database.migrate()
@@ -1142,6 +1147,32 @@ class QuestionBankStore:
             """
             CREATE INDEX idx_question_version_lifecycle_events_q_created
             ON question_version_lifecycle_events (question_id, created_at)
+            """
+        )
+
+    def _migrate_v4(self, connection: sqlite3.Connection) -> None:
+        """在存储边界强制同一题目至多保留一个活动版本。"""
+        duplicate = connection.execute(
+            """
+            SELECT question_id
+            FROM question_versions
+            WHERE is_active = 1
+            GROUP BY question_id
+            HAVING COUNT(*) > 1
+            ORDER BY question_id ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        if duplicate is not None:
+            raise RuntimeError(
+                "题库存在同题多个活动版本，拒绝启用单活动版本约束："
+                f"{duplicate['question_id']}"
+            )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX idx_question_versions_one_active_per_question
+            ON question_versions (question_id)
+            WHERE is_active = 1
             """
         )
 
