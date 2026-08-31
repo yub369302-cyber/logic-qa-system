@@ -640,9 +640,25 @@ def test_admin_version_lifecycle_routes_preserve_immutable_practice_ledger(
         json=second_payload,
     ).status_code == 200
 
+    events_path = "/v1/admin/questions/q-1/version-lifecycle-events"
+    events_after_publication = client.get(events_path, headers=_ADMIN_HEADERS)
+    assert events_after_publication.status_code == 200
+    assert events_after_publication.json() == [
+        {
+            "event_id": events_after_publication.json()[0]["event_id"],
+            "question_id": "q-1",
+            "content_version": "content-v1",
+            "content_hash": first_candidate["content_hash"],
+            "action": "superseded",
+            "actor_id": "admin-a",
+            "replaced_content_version": "content-v2",
+            "reason": "发布新的已审核内容版本",
+            "created_at": events_after_publication.json()[0]["created_at"],
+        }
+    ]
+
     deactivation_path = "/v1/admin/questions/q-1/content-v2/deactivation"
     reactivation_path = "/v1/admin/questions/q-1/content-v1/reactivation"
-    events_path = "/v1/admin/questions/q-1/version-lifecycle-events"
     unauthenticated = client.post(
         deactivation_path,
         json={"reason": "等待复核"},
@@ -694,7 +710,10 @@ def test_admin_version_lifecycle_routes_preserve_immutable_practice_ledger(
     assert unavailable_question.status_code == 404
     assert learner_events.status_code == 403
     assert events_after_deactivation.status_code == 200
-    assert events_after_deactivation.json() == [deactivated.json()]
+    assert events_after_deactivation.json() == [
+        events_after_publication.json()[0],
+        deactivated.json(),
+    ]
 
     reactivated = client.post(
         reactivation_path,
@@ -732,7 +751,11 @@ def test_admin_version_lifecycle_routes_preserve_immutable_practice_ledger(
     assert profile.json()["total_attempts"] == 1
     assert profile.json()["correct_attempts"] == 0
     assert events.status_code == 200
-    assert events.json() == [deactivated.json(), reactivated.json()]
+    assert events.json() == [
+        events_after_publication.json()[0],
+        deactivated.json(),
+        reactivated.json(),
+    ]
 
     stale_review = client.post(
         "/v1/admin/question-reviews",

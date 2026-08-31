@@ -676,6 +676,59 @@ def test_new_version_deactivates_old_version_but_keeps_history(tmp_path: Path) -
 
     assert first.content_version == "content-v1"
     assert question_store.active_questions() == (second,)
+    supersession_events = question_store.list_question_version_lifecycle_events("q-1")
+    assert len(supersession_events) == 1
+    superseded = supersession_events[0]
+    assert superseded.question_id == first.question_id
+    assert superseded.content_version == first.content_version
+    assert superseded.content_hash == first.content_hash
+    assert superseded.action.value == "superseded"
+    assert superseded.actor_id == "publisher-a"
+    assert superseded.replaced_content_version == second.content_version
+    assert superseded.reason == "发布新的已审核内容版本"
+    assert superseded.created_at == second.published_at
+
+
+def test_publish_rejects_a_corrupted_question_with_multiple_active_versions(
+    tmp_path: Path,
+) -> None:
+    """发布不会猜测多个活动版本的替代关系或写入部分审计事实。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    first_candidate, first_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    second_candidate, second_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v2", stem="q-1 的第二版本题干"),
+    )
+    third_candidate, third_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v3", stem="q-1 的第三版本题干"),
+    )
+    first = question_store.publish(first_candidate, "publisher-a", first_review)
+    second = question_store.publish(second_candidate, "publisher-a", second_review)
+    with question_store._connect() as connection:
+        connection.execute(
+            """
+            UPDATE question_versions
+            SET is_active = 1
+            WHERE question_id = ? AND content_version = ?
+            """,
+            (first.question_id, first.content_version),
+        )
+
+    with pytest.raises(ValueError, match="多个活动版本"):
+        question_store.publish(third_candidate, "publisher-a", third_review)
+
+    assert question_store.get_published_question("q-1", "content-v3") is None
+    assert question_store.active_questions() == (first, second)
+    lifecycle_events = question_store.list_question_version_lifecycle_events("q-1")
+    assert lifecycle_events[0].action.value == "superseded"
 
 
 def test_deactivation_and_reactivation_preserve_history_and_append_events(
@@ -739,10 +792,11 @@ def test_deactivation_and_reactivation_preserve_history_and_append_events(
         is not None
     )
     assert question_store.get_published_question("q-1", "content-v2") == second
-    assert question_store.list_question_version_lifecycle_events("q-1") == (
-        deactivated,
-        reactivated,
-    )
+    lifecycle_events = question_store.list_question_version_lifecycle_events("q-1")
+    assert lifecycle_events[0].action.value == "superseded"
+    assert lifecycle_events[0].content_version == first.content_version
+    assert lifecycle_events[0].replaced_content_version == second.content_version
+    assert lifecycle_events[1:] == (deactivated, reactivated)
     with question_store._connect() as connection:
         verification_count = connection.execute(
             """
@@ -1111,11 +1165,11 @@ def test_question_store_upgrades_v1_to_lifecycle_governance_schema(
     published = question_store.publish(candidate, "publisher-a", review)
     with question_store._connect() as connection:
         connection.execute("DROP TABLE question_version_lifecycle_events")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 2")
+        connection.execute("DELETE FROM schema_migrations WHERE version IN (2, 3)")
 
     upgraded_store = _question_store(tmp_path)
 
-    assert upgraded_store.schema_version() == 2
+    assert upgraded_store.schema_version() == 3
     assert upgraded_store.active_questions() == (published,)
     assert upgraded_store.list_question_version_lifecycle_events("q-1") == ()
     with sqlite3.connect(tmp_path / "questions.sqlite3") as connection:
@@ -1136,6 +1190,96 @@ def test_question_store_upgrades_v1_to_lifecycle_governance_schema(
         "reason",
         "created_at",
     }
+
+
+def test_question_store_upgrades_v2_lifecycle_events_for_supersession(
+    tmp_path: Path,
+) -> None:
+    """v2 生命周期事件在扩展动作约束时必须保持逐字段不变。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    candidate, review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    published = question_store.publish(candidate, "publisher-a", review)
+    deactivated = question_store.deactivate_active_version(
+        published.question_id,
+        published.content_version,
+        actor_id="admin-a",
+        reason="模拟既有 v2 下线事件",
+    )
+    reactivated = question_store.reactivate_published_version(
+        published.question_id,
+        published.content_version,
+        actor_id="admin-b",
+        reason="模拟既有 v2 重新激活事件",
+        review=review,
+    )
+    assert deactivated is not None
+    assert reactivated is not None
+
+    with question_store._connect() as connection:
+        connection.execute("DROP INDEX idx_question_version_lifecycle_events_q_created")
+        connection.execute(
+            """
+            CREATE TABLE question_version_lifecycle_events_v2 (
+                event_id TEXT PRIMARY KEY,
+                question_id TEXT NOT NULL,
+                content_version TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                action TEXT NOT NULL CHECK (action IN ('deactivated', 'reactivated')),
+                actor_id TEXT NOT NULL,
+                replaced_content_version TEXT,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO question_version_lifecycle_events_v2 (
+                event_id, question_id, content_version, content_hash, action, actor_id,
+                replaced_content_version, reason, created_at
+            )
+            SELECT event_id, question_id, content_version, content_hash, action,
+                   actor_id, replaced_content_version, reason, created_at
+            FROM question_version_lifecycle_events
+            ORDER BY rowid ASC
+            """
+        )
+        connection.execute("DROP TABLE question_version_lifecycle_events")
+        connection.execute(
+            """
+            ALTER TABLE question_version_lifecycle_events_v2
+            RENAME TO question_version_lifecycle_events
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX idx_question_version_lifecycle_events_q_created
+            ON question_version_lifecycle_events (question_id, created_at)
+            """
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 3")
+
+    upgraded_store = _question_store(tmp_path)
+
+    assert upgraded_store.schema_version() == 3
+    assert upgraded_store.list_question_version_lifecycle_events("q-1") == (
+        deactivated,
+        reactivated,
+    )
+    with sqlite3.connect(tmp_path / "questions.sqlite3") as connection:
+        table_sql = connection.execute(
+            """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'question_version_lifecycle_events'
+            """
+        ).fetchone()[0]
+    assert "'superseded'" in table_sql
 
 
 def test_question_store_restores_candidate_publication_and_audit_snapshot(
@@ -1179,7 +1323,7 @@ def test_question_store_restores_candidate_publication_and_audit_snapshot(
 
     question_store.restore_backup(question_store.load_backup(backup.manifest_path))
 
-    assert question_store.schema_version() == 2
+    assert question_store.schema_version() == 3
     assert question_store.active_questions() == (first_published,)
     assert question_store.list_question_version_lifecycle_events("q-1") == (
         first_deactivation,
