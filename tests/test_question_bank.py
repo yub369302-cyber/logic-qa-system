@@ -1302,12 +1302,12 @@ def test_question_store_upgrades_v1_to_lifecycle_governance_schema(
             "DROP INDEX idx_question_versions_one_active_per_question"
         )
         connection.execute(
-            "DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5)"
+            "DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6)"
         )
 
     upgraded_store = _question_store(tmp_path)
 
-    assert upgraded_store.schema_version() == 5
+    assert upgraded_store.schema_version() == 6
     assert upgraded_store.active_questions() == (published,)
     assert upgraded_store.list_question_version_lifecycle_events("q-1") == ()
     with sqlite3.connect(tmp_path / "questions.sqlite3") as connection:
@@ -1403,11 +1403,13 @@ def test_question_store_upgrades_v2_lifecycle_events_for_supersession(
         connection.execute(
             "DROP INDEX idx_question_versions_one_active_per_question"
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version IN (3, 4, 5)")
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version IN (3, 4, 5, 6)"
+        )
 
     upgraded_store = _question_store(tmp_path)
 
-    assert upgraded_store.schema_version() == 5
+    assert upgraded_store.schema_version() == 6
     assert upgraded_store.list_question_version_lifecycle_events("q-1") == (
         deactivated,
         reactivated,
@@ -1495,6 +1497,70 @@ def test_question_store_prevents_lifecycle_audit_rewrites_in_sqlite(
     assert question_store.list_question_version_lifecycle_events("q-1") == (event,)
 
 
+def test_question_store_prevents_lifecycle_audit_references_to_unknown_versions(
+    tmp_path: Path,
+) -> None:
+    """SQLite 触发器必须阻止直接写入伪造或跨题替代版本审计。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    first_candidate, first_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    second_candidate, second_review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-2", "content-v2"),
+    )
+    first = question_store.publish(first_candidate, "publisher-a", first_review)
+    second = question_store.publish(second_candidate, "publisher-a", second_review)
+
+    with question_store._connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="摘要一致"):
+            connection.execute(
+                """
+                INSERT INTO question_version_lifecycle_events (
+                    event_id, question_id, content_version, content_hash, action,
+                    actor_id, replaced_content_version, reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "forged-content-hash",
+                    first.question_id,
+                    first.content_version,
+                    "0" * 64,
+                    "deactivated",
+                    "admin-a",
+                    None,
+                    "尝试伪造不存在的审计版本",
+                    first.published_at,
+                ),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="审计替代版本"):
+            connection.execute(
+                """
+                INSERT INTO question_version_lifecycle_events (
+                    event_id, question_id, content_version, content_hash, action,
+                    actor_id, replaced_content_version, reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "cross-question-replacement",
+                    first.question_id,
+                    first.content_version,
+                    first.content_hash,
+                    "superseded",
+                    "admin-a",
+                    second.content_version,
+                    "尝试引用另一题目的替代版本",
+                    first.published_at,
+                ),
+            )
+
+    assert question_store.list_question_version_lifecycle_events("q-1") == ()
+
+
 def test_question_store_rejects_duplicate_active_versions_when_upgrading_to_v4(
     tmp_path: Path,
 ) -> None:
@@ -1527,7 +1593,10 @@ def test_question_store_rejects_duplicate_active_versions_when_upgrading_to_v4(
         connection.execute(
             "DROP TRIGGER trg_question_version_lifecycle_events_no_delete"
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version IN (4, 5)")
+        connection.execute(
+            "DROP TRIGGER trg_question_version_lifecycle_events_reference_versions"
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version IN (4, 5, 6)")
 
     with pytest.raises(RuntimeError, match="多个活动版本"):
         _question_store(tmp_path)
@@ -1576,11 +1645,14 @@ def test_question_store_upgrades_v4_lifecycle_events_with_storage_protection(
         connection.execute(
             "DROP TRIGGER trg_question_version_lifecycle_events_no_delete"
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version = 5")
+        connection.execute(
+            "DROP TRIGGER trg_question_version_lifecycle_events_reference_versions"
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version IN (5, 6)")
 
     upgraded_store = _question_store(tmp_path)
 
-    assert upgraded_store.schema_version() == 5
+    assert upgraded_store.schema_version() == 6
     assert upgraded_store.list_question_version_lifecycle_events("q-1") == (event,)
     with upgraded_store._connect() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="不可删除"):
@@ -1588,6 +1660,63 @@ def test_question_store_upgrades_v4_lifecycle_events_with_storage_protection(
                 "DELETE FROM question_version_lifecycle_events WHERE event_id = ?",
                 (event.event_id,),
             )
+
+
+def test_question_store_rejects_invalid_lifecycle_audit_references_when_upgrading_to_v6(
+    tmp_path: Path,
+) -> None:
+    """迁移发现伪造生命周期引用时必须关闭，而不是保留不可信审计。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    candidate, review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    published = question_store.publish(candidate, "publisher-a", review)
+
+    with question_store._connect() as connection:
+        connection.execute(
+            "DROP TRIGGER trg_question_version_lifecycle_events_reference_versions"
+        )
+        connection.execute(
+            """
+            INSERT INTO question_version_lifecycle_events (
+                event_id, question_id, content_version, content_hash, action, actor_id,
+                replaced_content_version, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "corrupt-lifecycle-reference",
+                published.question_id,
+                published.content_version,
+                "0" * 64,
+                "deactivated",
+                "admin-a",
+                None,
+                "模拟既有伪造审计引用",
+                published.published_at,
+            ),
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 6")
+
+    with pytest.raises(RuntimeError, match="引用不存在或摘要不一致"):
+        _question_store(tmp_path)
+
+    with sqlite3.connect(tmp_path / "questions.sqlite3") as connection:
+        event = connection.execute(
+            """
+            SELECT content_hash
+            FROM question_version_lifecycle_events
+            WHERE event_id = ?
+            """,
+            ("corrupt-lifecycle-reference",),
+        ).fetchone()
+        schema_version = connection.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+        ).fetchone()[0]
+    assert event == ("0" * 64,)
+    assert schema_version == 5
 
 
 def test_question_store_restores_candidate_publication_and_audit_snapshot(
@@ -1631,7 +1760,7 @@ def test_question_store_restores_candidate_publication_and_audit_snapshot(
 
     question_store.restore_backup(question_store.load_backup(backup.manifest_path))
 
-    assert question_store.schema_version() == 5
+    assert question_store.schema_version() == 6
     assert question_store.active_questions() == (first_published,)
     assert question_store.list_question_version_lifecycle_events("q-1") == (
         first_deactivation,

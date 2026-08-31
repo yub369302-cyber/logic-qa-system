@@ -322,6 +322,11 @@ class QuestionBankStore:
                     "protect_question_version_lifecycle_audit",
                     self._migrate_v5,
                 ),
+                DatabaseMigration(
+                    6,
+                    "validate_question_version_lifecycle_references",
+                    self._migrate_v6,
+                ),
             ),
         )
         self._database.migrate()
@@ -1198,6 +1203,62 @@ class QuestionBankStore:
             BEFORE DELETE ON question_version_lifecycle_events
             BEGIN
                 SELECT RAISE(ABORT, '版本生命周期审计事件不可删除');
+            END
+            """
+        )
+
+    def _migrate_v6(self, connection: sqlite3.Connection) -> None:
+        """确保生命周期审计只引用真实且摘要一致的已发布版本。"""
+        invalid = connection.execute(
+            """
+            SELECT event_id
+            FROM question_version_lifecycle_events AS event
+            LEFT JOIN question_versions AS version
+                ON version.question_id = event.question_id
+                AND version.content_version = event.content_version
+                AND version.content_hash = event.content_hash
+            LEFT JOIN question_versions AS replacement
+                ON replacement.question_id = event.question_id
+                AND replacement.content_version = event.replaced_content_version
+            WHERE version.question_id IS NULL
+                OR (
+                    event.replaced_content_version IS NOT NULL
+                    AND replacement.question_id IS NULL
+                )
+            ORDER BY event.rowid ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalid is not None:
+            raise RuntimeError(
+                "生命周期审计事件引用不存在或摘要不一致的题目版本，拒绝启用引用完整性约束："
+                f"{invalid['event_id']}"
+            )
+        connection.execute(
+            """
+            CREATE TRIGGER trg_question_version_lifecycle_events_reference_versions
+            BEFORE INSERT ON question_version_lifecycle_events
+            BEGIN
+                SELECT CASE
+                    WHEN NOT EXISTS (
+                        SELECT 1
+                        FROM question_versions
+                        WHERE question_id = NEW.question_id
+                            AND content_version = NEW.content_version
+                            AND content_hash = NEW.content_hash
+                    )
+                    THEN RAISE(ABORT, '生命周期审计事件必须引用摘要一致的已发布版本')
+                END;
+                SELECT CASE
+                    WHEN NEW.replaced_content_version IS NOT NULL
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM question_versions
+                            WHERE question_id = NEW.question_id
+                                AND content_version = NEW.replaced_content_version
+                        )
+                    THEN RAISE(ABORT, '生命周期审计替代版本必须已发布且属于同一题目')
+                END;
             END
             """
         )
