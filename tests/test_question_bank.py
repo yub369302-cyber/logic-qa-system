@@ -846,6 +846,19 @@ def test_reactivation_replaces_current_version_after_revalidation(
     assert question_store.active_questions() == (first,)
     assert question_store.get_active_published_question("q-1", "content-v2") is None
     assert question_store.get_published_question("q-1", "content-v2") == second
+    lifecycle_events = question_store.list_question_version_lifecycle_events("q-1")
+    assert [event.action.value for event in lifecycle_events] == [
+        "superseded",
+        "superseded",
+        "reactivated",
+    ]
+    superseded_by_reactivation = lifecycle_events[1]
+    assert superseded_by_reactivation.content_version == second.content_version
+    assert superseded_by_reactivation.content_hash == second.content_hash
+    assert superseded_by_reactivation.actor_id == "admin-a"
+    assert superseded_by_reactivation.replaced_content_version == first.content_version
+    assert superseded_by_reactivation.reason == "重新激活已审核历史版本"
+    assert superseded_by_reactivation.created_at == reactivated.created_at
 
 
 def test_reactivation_requires_current_exact_approval_and_immutable_candidate(

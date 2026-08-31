@@ -785,6 +785,75 @@ def test_admin_version_lifecycle_routes_preserve_immutable_practice_ledger(
     ).status_code == 200
 
 
+def test_admin_reactivation_supersedes_the_current_active_version(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """回滚替换活动版本时，管理员审计视图必须保留双向生命周期事实。"""
+    client = _client_with_stores(tmp_path, monkeypatch)
+    first_payload = _publish_payload("q-1", "content-v1")
+    second_payload = {
+        **_publish_payload("q-1", "content-v2"),
+        "stem": "q-1 的回滚替换新版题干",
+    }
+    first_candidate = _prepare_and_approve(client, first_payload)
+    second_candidate = _prepare_and_approve(client, second_payload)
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=first_payload,
+    ).status_code == 200
+    assert client.post(
+        "/v1/admin/questions",
+        headers=_ADMIN_HEADERS,
+        json=second_payload,
+    ).status_code == 200
+
+    reactivated = client.post(
+        "/v1/admin/questions/q-1/content-v1/reactivation",
+        headers=_ADMIN_HEADERS,
+        json={"reason": "复验通过，回滚至历史版本"},
+    )
+    events = client.get(
+        "/v1/admin/questions/q-1/version-lifecycle-events",
+        headers=_ADMIN_HEADERS,
+    )
+
+    assert reactivated.status_code == 200
+    assert reactivated.json()["action"] == "reactivated"
+    assert reactivated.json()["replaced_content_version"] == "content-v2"
+    assert events.status_code == 200
+    lifecycle_events = events.json()
+    assert [event["action"] for event in lifecycle_events] == [
+        "superseded",
+        "superseded",
+        "reactivated",
+    ]
+    superseded_by_reactivation = lifecycle_events[1]
+    assert superseded_by_reactivation == {
+        "event_id": superseded_by_reactivation["event_id"],
+        "question_id": "q-1",
+        "content_version": "content-v2",
+        "content_hash": second_candidate["content_hash"],
+        "action": "superseded",
+        "actor_id": "admin-a",
+        "replaced_content_version": "content-v1",
+        "reason": "重新激活已审核历史版本",
+        "created_at": reactivated.json()["created_at"],
+    }
+    assert lifecycle_events[2] == {
+        "event_id": reactivated.json()["event_id"],
+        "question_id": "q-1",
+        "content_version": "content-v1",
+        "content_hash": first_candidate["content_hash"],
+        "action": "reactivated",
+        "actor_id": "admin-a",
+        "replaced_content_version": "content-v2",
+        "reason": "复验通过，回滚至历史版本",
+        "created_at": reactivated.json()["created_at"],
+    }
+
+
 def test_republication_outcome_downgrades_when_question_bank_is_unavailable(
     tmp_path: Path,
     monkeypatch,
