@@ -1,6 +1,7 @@
 """内容绑定审核题库发布与个人练习推荐的回归测试。"""
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -807,6 +808,48 @@ def test_deactivation_and_reactivation_preserve_history_and_append_events(
             (first.question_id, first.content_version, first.content_hash),
         ).fetchone()["count"]
     assert verification_count == 2
+
+
+def test_deactivation_is_atomic_under_concurrent_administrators(
+    tmp_path: Path,
+) -> None:
+    """竞争下线同一活动版本时，只能提交一条下线事实。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    candidate, review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    published = question_store.publish(candidate, "publisher-a", review)
+
+    def deactivate() -> str:
+        try:
+            event = question_store.deactivate_active_version(
+                published.question_id,
+                published.content_version,
+                actor_id="admin-a",
+                reason="并发下线治理测试",
+            )
+        except ValueError as error:
+            assert "当前未活动" in str(error)
+            return "already_inactive"
+        assert event is not None
+        return event.event_id
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        outcomes = tuple(executor.map(lambda _: deactivate(), range(4)))
+
+    successful_event_ids = tuple(
+        outcome for outcome in outcomes if outcome != "already_inactive"
+    )
+    assert len(successful_event_ids) == 1
+    assert outcomes.count("already_inactive") == 3
+    assert question_store.active_questions() == ()
+    lifecycle_events = question_store.list_question_version_lifecycle_events("q-1")
+    assert len(lifecycle_events) == 1
+    assert lifecycle_events[0].event_id == successful_event_ids[0]
+    assert lifecycle_events[0].action.value == "deactivated"
 
 
 def test_reactivation_replaces_current_version_after_revalidation(
