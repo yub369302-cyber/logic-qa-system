@@ -317,6 +317,11 @@ class QuestionBankStore:
                     "enforce_one_active_question_version",
                     self._migrate_v4,
                 ),
+                DatabaseMigration(
+                    5,
+                    "protect_question_version_lifecycle_audit",
+                    self._migrate_v5,
+                ),
             ),
         )
         self._database.migrate()
@@ -1173,6 +1178,27 @@ class QuestionBankStore:
             CREATE UNIQUE INDEX idx_question_versions_one_active_per_question
             ON question_versions (question_id)
             WHERE is_active = 1
+            """
+        )
+
+    def _migrate_v5(self, connection: sqlite3.Connection) -> None:
+        """禁止直接改写或删除版本生命周期审计事件。"""
+        connection.execute(
+            """
+            CREATE TRIGGER trg_question_version_lifecycle_events_no_update
+            BEFORE UPDATE ON question_version_lifecycle_events
+            BEGIN
+                SELECT RAISE(ABORT, '版本生命周期审计事件不可修改');
+            END
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER trg_question_version_lifecycle_events_no_delete
+            BEFORE DELETE ON question_version_lifecycle_events
+            BEGIN
+                SELECT RAISE(ABORT, '版本生命周期审计事件不可删除');
+            END
             """
         )
 

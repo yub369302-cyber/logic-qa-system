@@ -1302,12 +1302,12 @@ def test_question_store_upgrades_v1_to_lifecycle_governance_schema(
             "DROP INDEX idx_question_versions_one_active_per_question"
         )
         connection.execute(
-            "DELETE FROM schema_migrations WHERE version IN (2, 3, 4)"
+            "DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5)"
         )
 
     upgraded_store = _question_store(tmp_path)
 
-    assert upgraded_store.schema_version() == 4
+    assert upgraded_store.schema_version() == 5
     assert upgraded_store.active_questions() == (published,)
     assert upgraded_store.list_question_version_lifecycle_events("q-1") == ()
     with sqlite3.connect(tmp_path / "questions.sqlite3") as connection:
@@ -1403,11 +1403,11 @@ def test_question_store_upgrades_v2_lifecycle_events_for_supersession(
         connection.execute(
             "DROP INDEX idx_question_versions_one_active_per_question"
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version IN (3, 4)")
+        connection.execute("DELETE FROM schema_migrations WHERE version IN (3, 4, 5)")
 
     upgraded_store = _question_store(tmp_path)
 
-    assert upgraded_store.schema_version() == 4
+    assert upgraded_store.schema_version() == 5
     assert upgraded_store.list_question_version_lifecycle_events("q-1") == (
         deactivated,
         reactivated,
@@ -1456,6 +1456,45 @@ def test_question_store_prevents_multiple_active_versions_in_sqlite(
     assert question_store.active_questions() == (second,)
 
 
+def test_question_store_prevents_lifecycle_audit_rewrites_in_sqlite(
+    tmp_path: Path,
+) -> None:
+    """SQLite 触发器必须阻止绕过领域服务改写或删除生命周期审计。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    candidate, review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    published = question_store.publish(candidate, "publisher-a", review)
+    event = question_store.deactivate_active_version(
+        published.question_id,
+        published.content_version,
+        actor_id="admin-a",
+        reason="验证生命周期审计存储保护",
+    )
+    assert event is not None
+
+    with question_store._connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="不可修改"):
+            connection.execute(
+                """
+                UPDATE question_version_lifecycle_events
+                SET reason = ?
+                WHERE event_id = ?
+                """,
+                ("尝试改写审计理由", event.event_id),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="不可删除"):
+            connection.execute(
+                "DELETE FROM question_version_lifecycle_events WHERE event_id = ?",
+                (event.event_id,),
+            )
+
+    assert question_store.list_question_version_lifecycle_events("q-1") == (event,)
+
+
 def test_question_store_rejects_duplicate_active_versions_when_upgrading_to_v4(
     tmp_path: Path,
 ) -> None:
@@ -1482,7 +1521,13 @@ def test_question_store_rejects_duplicate_active_versions_when_upgrading_to_v4(
             "UPDATE question_versions SET is_active = 1 WHERE question_id = ?",
             (first.question_id,),
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version = 4")
+        connection.execute(
+            "DROP TRIGGER trg_question_version_lifecycle_events_no_update"
+        )
+        connection.execute(
+            "DROP TRIGGER trg_question_version_lifecycle_events_no_delete"
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version IN (4, 5)")
 
     with pytest.raises(RuntimeError, match="多个活动版本"):
         _question_store(tmp_path)
@@ -1502,6 +1547,47 @@ def test_question_store_rejects_duplicate_active_versions_when_upgrading_to_v4(
         ).fetchone()[0]
     assert rows == [(first.content_version, 1), (second.content_version, 1)]
     assert schema_version == 3
+
+
+def test_question_store_upgrades_v4_lifecycle_events_with_storage_protection(
+    tmp_path: Path,
+) -> None:
+    """升级到 v5 后既有审计事件保持不变，并获得数据库层不可变保护。"""
+    question_store = _question_store(tmp_path)
+    review_store = _review_store(tmp_path)
+    candidate, review = _approved_review(
+        review_store,
+        question_store,
+        _publication("q-1", "content-v1"),
+    )
+    published = question_store.publish(candidate, "publisher-a", review)
+    event = question_store.deactivate_active_version(
+        published.question_id,
+        published.content_version,
+        actor_id="admin-a",
+        reason="模拟既有 v4 下线审计",
+    )
+    assert event is not None
+
+    with question_store._connect() as connection:
+        connection.execute(
+            "DROP TRIGGER trg_question_version_lifecycle_events_no_update"
+        )
+        connection.execute(
+            "DROP TRIGGER trg_question_version_lifecycle_events_no_delete"
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 5")
+
+    upgraded_store = _question_store(tmp_path)
+
+    assert upgraded_store.schema_version() == 5
+    assert upgraded_store.list_question_version_lifecycle_events("q-1") == (event,)
+    with upgraded_store._connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="不可删除"):
+            connection.execute(
+                "DELETE FROM question_version_lifecycle_events WHERE event_id = ?",
+                (event.event_id,),
+            )
 
 
 def test_question_store_restores_candidate_publication_and_audit_snapshot(
@@ -1545,7 +1631,7 @@ def test_question_store_restores_candidate_publication_and_audit_snapshot(
 
     question_store.restore_backup(question_store.load_backup(backup.manifest_path))
 
-    assert question_store.schema_version() == 4
+    assert question_store.schema_version() == 5
     assert question_store.active_questions() == (first_published,)
     assert question_store.list_question_version_lifecycle_events("q-1") == (
         first_deactivation,
