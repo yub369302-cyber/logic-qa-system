@@ -719,6 +719,7 @@ class QuestionBankStore:
         self._validate_review(candidate, review)
         created_at = datetime.now(UTC).isoformat()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             target = connection.execute(
                 """
                 SELECT is_active
@@ -733,7 +734,9 @@ class QuestionBankStore:
                 raise ValueError("该题目版本当前已活动，无需重新激活")
             active_rows = connection.execute(
                 """
-                SELECT content_version
+                SELECT question_id, content_version, content_hash, question_type, stem,
+                       options, error_tags, knowledge_tags, formalization_version,
+                       formalization, published_at
                 FROM question_versions
                 WHERE question_id = ? AND is_active = 1
                 ORDER BY content_version ASC
@@ -742,8 +745,11 @@ class QuestionBankStore:
             ).fetchall()
             if len(active_rows) > 1:
                 raise ValueError("该题目存在多个活动版本，拒绝执行重新激活")
+            superseded_question = (
+                _question_from_row(active_rows[0]) if active_rows else None
+            )
             replaced_content_version = (
-                active_rows[0]["content_version"] if active_rows else None
+                superseded_question.content_version if superseded_question else None
             )
             connection.execute(
                 "UPDATE question_versions SET is_active = 0 WHERE question_id = ?",
@@ -765,6 +771,16 @@ class QuestionBankStore:
                 verification=verification,
                 created_at=created_at,
             )
+            if superseded_question is not None:
+                _insert_question_version_lifecycle_event(
+                    connection,
+                    question=superseded_question,
+                    action=QuestionVersionLifecycleAction.SUPERSEDED,
+                    actor_id=normalized_actor_id,
+                    replaced_content_version=question.content_version,
+                    reason="重新激活已审核历史版本",
+                    created_at=created_at,
+                )
             event = _insert_question_version_lifecycle_event(
                 connection,
                 question=question,
